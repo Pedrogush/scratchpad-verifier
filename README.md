@@ -54,12 +54,20 @@ recovered/
     ├── scratchpad/                # paths inside .../scratchpad/
     │   ├── plan_00.md
     │   └── plan_01.md
-    └── tmp/                       # other paths under /tmp/
-        └── build/
-            ├── run_00.sh          # first Write
-            ├── run_01.sh          # after the first Edit
-            └── run_02.sh          # after the second Edit
+    ├── tmp/                       # other paths under /tmp/
+    │   └── build/
+    │       ├── run_00.sh          # first Write
+    │       ├── run_01.sh          # after the first Edit
+    │       └── run_02.sh          # after the second Edit
+    └── errored/                   # tool calls that returned an error
+        └── tmp/build/
+            └── run_00.sh.json     # first failed call on run.sh
 ```
+
+Each file in `errored/` is a JSON record of one failed `Write`, `Edit` or
+`MultiEdit` call: the tool name, file path, timestamp, the error message and
+the full tool input (`content`, or `old_string`/`new_string`/`edits`). Failed
+calls are numbered per file in the same way and don't create a version.
 
 Subdirectories below the scratchpad or `/tmp` are kept. Files matched only via
 `--prefix`, `--marker` or `--all` go under `other/<original path>`. If an edit

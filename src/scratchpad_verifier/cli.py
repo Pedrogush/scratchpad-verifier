@@ -60,6 +60,10 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "status": _status(st),
                 "operations": [o.tool for o in st.operations],
                 "versions": len(st.versions),
+                "errored": [
+                    {"tool": o.tool, "timestamp": o.timestamp, "error": o.error}
+                    for o in st.errored
+                ],
                 "bytes": len(st.content.encode()) if st.content is not None else None,
                 "problems": st.problems,
             }
@@ -70,6 +74,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     for st in states.values():
         size = f"{len(st.content.encode()):>8}B" if st.content is not None else "       ?B"
         ops = ",".join(o.tool for o in st.operations)
+        ops = ",".join(o.tool + ("!" if o.is_error else "") for o in st.operations)
         print(f"{_status(st):<8} {size}  v{len(st.versions):<3} {st.path}  [{ops}]")
     if not states:
         print("no matching files", file=sys.stderr)
@@ -102,19 +107,45 @@ def cmd_extract(args: argparse.Namespace) -> int:
     states = _load(args)
     session_dir = Path(args.output) / args.session_id
     count = 0
+    errored = 0
     for st in states.values():
-        if not st.versions:
+        rel_dir = output_dir_for(st.path)
+        if st.versions:
+            dest_dir = session_dir / rel_dir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            names = versioned_names(st.path, len(st.versions))
+            for name, content in zip(names, st.versions):
+                dest = dest_dir / name
+                dest.write_text(content, encoding="utf-8")
+                count += 1
+                if args.verbose:
+                    print(dest)
+        elif not st.errored:
             print(f"skip (unknown content): {st.path}", file=sys.stderr)
-            continue
-        dest_dir = session_dir / output_dir_for(st.path)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        for name, content in zip(versioned_names(st.path, len(st.versions)), st.versions):
-            dest = dest_dir / name
-            dest.write_text(content, encoding="utf-8")
-            count += 1
-            if args.verbose:
-                print(dest)
-    print(f"wrote {count} file(s) to {session_dir}", file=sys.stderr)
+
+        failed = st.errored
+        if failed:
+            err_dir = session_dir / "errored" / rel_dir
+            err_dir.mkdir(parents=True, exist_ok=True)
+            names = versioned_names(st.path, len(failed))
+            for name, op in zip(names, failed):
+                dest = err_dir / f"{name}.json"
+                record = {
+                    "tool": op.tool,
+                    "file_path": op.path,
+                    "timestamp": op.timestamp,
+                    "tool_use_id": op.tool_use_id,
+                    "error": op.error,
+                    "input": op.input,
+                }
+                dest.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                errored += 1
+                if args.verbose:
+                    print(dest)
+    print(
+        f"wrote {count} file version(s) and {errored} errored call(s) to {session_dir}",
+        file=sys.stderr,
+    )
     return 0
 
 

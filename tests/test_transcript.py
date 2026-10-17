@@ -19,12 +19,12 @@ def tool_use(tid, name, inp, ts):
     }
 
 
-def tool_result(tid, ts, result=None, is_error=False):
+def tool_result(tid, ts, result=None, is_error=False, text="ok"):
     rec = {
         "type": "user",
         "timestamp": ts,
         "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": tid, "content": "ok", "is_error": is_error},
+            {"type": "tool_result", "tool_use_id": tid, "content": text, "is_error": is_error},
         ]},
     }
     if result is not None:
@@ -165,6 +165,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual((session / "tmp/run/a_02.sh").read_text(), "echo 3\n")
         self.assertEqual((session / "scratchpad/notes_00.md").read_text(), "hello\n")
         self.assertEqual(len(list(session.rglob("*.*"))), 4)
+
+    def test_extract_errored_calls(self):
+        bad = {"file_path": "/tmp/run/a.sh", "old_string": "nope", "new_string": "x"}
+        write_jsonl(self.transcript, [
+            tool_use("t1", "Write", {"file_path": "/tmp/run/a.sh", "content": "echo 1\n"}, "1"),
+            tool_use("t2", "Edit", bad, "2"),
+            tool_result("t2", "3", is_error=True, text="String to replace not found in file."),
+            tool_use("t3", "Write", {"file_path": "/tmp/never.txt", "content": "x"}, "4"),
+            tool_result("t3", "5", is_error=True, text="Permission denied"),
+        ])
+        out_dir = self.dir / "out"
+        self.run_cli("extract", str(self.transcript), "-o", str(out_dir))
+        session = out_dir / "session"
+        self.assertEqual(sorted(p.name for p in (session / "tmp/run").iterdir()), ["a_00.sh"])
+        rec = json.loads((session / "errored/tmp/run/a_00.sh.json").read_text())
+        self.assertEqual(rec["tool"], "Edit")
+        self.assertEqual(rec["input"], bad)
+        self.assertEqual(rec["error"], "String to replace not found in file.")
+        rec = json.loads((session / "errored/tmp/never_00.txt.json").read_text())
+        self.assertEqual(rec["error"], "Permission denied")
+        self.assertFalse((session / "tmp/never_00.txt").exists())
 
     def test_verify(self):
         root = self.dir / "root"

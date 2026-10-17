@@ -23,6 +23,7 @@ class Operation:
     timestamp: str | None = None
     source: str = ""
     is_error: bool = False
+    error: str | None = None
     result: dict | None = None
 
 
@@ -36,6 +37,10 @@ class FileState:
     # Content after each successful iteration, oldest first. If the first
     # operation edited a pre-existing file, its original content comes first.
     versions: list[str] = field(default_factory=list)
+
+    @property
+    def errored(self) -> list[Operation]:
+        return [o for o in self.operations if o.is_error]
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -76,6 +81,16 @@ def _content_blocks(rec: dict) -> list:
     return content if isinstance(content, list) else []
 
 
+def _result_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
 def collect_operations(files: Iterable[Path]) -> list[Operation]:
     """Collect file-writing tool calls, matched with their results, in time order."""
     ops: dict[str, Operation] = {}
@@ -112,6 +127,10 @@ def collect_operations(files: Iterable[Path]) -> list[Operation]:
                     if op is None:
                         continue
                     op.is_error = bool(block.get("is_error"))
+                    if op.is_error:
+                        op.error = _result_text(block.get("content")).strip()
+                        if op.error.startswith("<tool_use_error>") and op.error.endswith("</tool_use_error>"):
+                            op.error = op.error[len("<tool_use_error>") : -len("</tool_use_error>")]
                     if isinstance(tur, dict):
                         op.result = tur
     result = [ops[t] for t in order]

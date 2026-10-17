@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scratchpad-verifier"
+dynamic = ["version"]
+description = "Reconstruct /tmp and scratchpad files from a Claude Code session's .jsonl transcript"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Pedrogush" }]
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Environment :: Console",
+]
+
+[project.urls]
+Homepage = "https://github.com/Pedrogush/scratchpad-verifier"
+
+[project.scripts]
+scratchpad-verifier = "scratchpad_verifier.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "scratchpad_verifier.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

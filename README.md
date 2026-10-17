@@ -12,6 +12,34 @@ wrote.
 
 ## Install
 
+### With uv (recommended)
+
+Install it once as a global command, in its own isolated environment:
+
+```bash
+uv tool install git+https://github.com/Pedrogush/scratchpad-verifier
+```
+
+If your shell then can't find `scratchpad-verifier`, run `uv tool update-shell`
+once and open a new terminal (it adds uv's tool directory, usually
+`~/.local/bin`, to your `PATH`).
+
+```bash
+uv tool upgrade scratchpad-verifier     # pull the latest version
+uv tool uninstall scratchpad-verifier   # remove it
+```
+
+Or run it without installing:
+
+```bash
+uvx --from git+https://github.com/Pedrogush/scratchpad-verifier scratchpad-verifier list <session-id>
+```
+
+From a local clone, use `uv tool install .` (add `--editable` while hacking
+on it).
+
+### With pip
+
 ```bash
 pip install git+https://github.com/Pedrogush/scratchpad-verifier
 # or, from a clone

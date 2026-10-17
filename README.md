@@ -26,7 +26,7 @@ The `TRANSCRIPT` argument is a path to a `.jsonl` file, or a bare session id
 (looked up under `~/.claude/projects/*/`, or `$CLAUDE_CONFIG_DIR/projects`).
 
 ```bash
-# List reconstructed files with status, size and the tool calls that touched them
+# List reconstructed files (status, size, versions, tool calls) and failed calls
 scratchpad-verifier list ~/.claude/projects/-home-me-app/1234abcd.jsonl
 scratchpad-verifier list 1234abcd --json
 
@@ -59,15 +59,24 @@ recovered/
     │       ├── run_00.sh          # first Write
     │       ├── run_01.sh          # after the first Edit
     │       └── run_02.sh          # after the second Edit
-    └── errored/                   # tool calls that returned an error
-        └── tmp/build/
-            └── run_00.sh.json     # first failed call on run.sh
+    └── errored/                   # every tool call that returned an error
+        ├── tmp/build/
+        │   └── run_00.sh.json     # first failed Write/Edit on run.sh
+        ├── bash/
+        │   ├── bash_00.json       # failed Bash commands, in order
+        │   └── bash_01.json
+        ├── mcp__github__get_me/   # any other tool, one folder per tool name
+        └── other/home/me/app_00.py.json   # failed write outside /tmp & scratchpad
 ```
 
-Each file in `errored/` is a JSON record of one failed `Write`, `Edit` or
-`MultiEdit` call: the tool name, file path, timestamp, the error message and
-the full tool input (`content`, or `old_string`/`new_string`/`edits`). Failed
-calls are numbered per file in the same way and don't create a version.
+Each file in `errored/` is a JSON record of one failed tool call: the tool
+name, file path (if any), timestamp, the error message (for Bash: the exit
+code and output) and the full tool input (`command`, `content`,
+`old_string`/`new_string`, ...). Failed file writes are numbered per file and
+don't create a version; other failures are numbered per tool.
+
+`list` marks failed file calls with `!` (e.g. `[Write,Edit!]`) and lists every
+other failed call, Bash included, below the files.
 
 Subdirectories below the scratchpad or `/tmp` are kept. Files matched only via
 `--prefix`, `--marker` or `--all` go under `other/<original path>`. If an edit

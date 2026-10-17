@@ -187,6 +187,36 @@ class CliTests(unittest.TestCase):
         self.assertEqual(rec["error"], "Permission denied")
         self.assertFalse((session / "tmp/never_00.txt").exists())
 
+    def test_extract_errored_bash_and_other_tools(self):
+        write_jsonl(self.transcript, [
+            tool_use("b1", "Bash", {"command": "pytest", "description": "run tests"}, "1"),
+            tool_result("b1", "2", is_error=True, text="Exit code 1\n2 failed"),
+            tool_use("b2", "Bash", {"command": "ls"}, "3"),
+            tool_result("b2", "4", text="a b"),
+            tool_use("b3", "Bash", {"command": "make"}, "5"),
+            tool_result("b3", "6", is_error=True, text="Exit code 2"),
+            tool_use("m1", "mcp__github__get_me", {}, "7"),
+            tool_result("m1", "8", is_error=True, text=[{"type": "text", "text": "401"}]),
+            tool_use("w1", "Write", {"file_path": "/home/me/app.py", "content": "x"}, "9"),
+            tool_result("w1", "10", is_error=True, text="denied"),
+        ])
+        out_dir = self.dir / "out"
+        self.run_cli("extract", str(self.transcript), "-o", str(out_dir))
+        err = out_dir / "session" / "errored"
+        self.assertEqual(sorted(p.name for p in (err / "bash").iterdir()), ["bash_00.json", "bash_01.json"])
+        rec = json.loads((err / "bash/bash_00.json").read_text())
+        self.assertEqual(rec["input"]["command"], "pytest")
+        self.assertEqual(rec["error"], "Exit code 1\n2 failed")
+        self.assertEqual(json.loads((err / "bash/bash_01.json").read_text())["input"]["command"], "make")
+        rec = json.loads((err / "mcp__github__get_me/mcp__github__get_me_00.json").read_text())
+        self.assertEqual(rec["error"], "401")
+        rec = json.loads((err / "other/home/me/app_00.py.json").read_text())
+        self.assertEqual(rec["error"], "denied")
+
+        rc, out = self.run_cli("list", str(self.transcript))
+        self.assertIn("4 other errored tool call(s)", out)
+        self.assertIn("pytest", out)
+
     def test_verify(self):
         root = self.dir / "root"
         disk = root / SP.lstrip("/")
@@ -203,7 +233,7 @@ class CliTests(unittest.TestCase):
 
     def test_list_json(self):
         rc, out = self.run_cli("list", str(self.transcript), "--json")
-        data = json.loads(out)
+        data = json.loads(out)["files"]
         self.assertEqual(data[0]["path"], SP)
         self.assertEqual(data[0]["status"], "ok")
 

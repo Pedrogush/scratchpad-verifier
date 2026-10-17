@@ -93,6 +93,14 @@ def _result_text(content) -> str:
 
 def collect_operations(files: Iterable[Path]) -> list[Operation]:
     """Collect file-writing tool calls, matched with their results, in time order."""
+    return [o for o in collect_calls(files) if o.tool in FILE_TOOLS and o.path]
+
+
+def collect_calls(files: Iterable[Path]) -> list[Operation]:
+    """Collect every tool call, matched with its result, in time order.
+
+    ``path`` is the ``file_path`` input when the tool has one, else "".
+    """
     ops: dict[str, Operation] = {}
     order: list[str] = []
     for file in files:
@@ -104,14 +112,15 @@ def collect_operations(files: Iterable[Path]) -> list[Operation]:
                         continue
                     name = block.get("name")
                     inp = block.get("input") or {}
-                    if name not in FILE_TOOLS or not isinstance(inp.get("file_path"), str):
-                        continue
+                    if not isinstance(inp, dict):
+                        inp = {"input": inp}
+                    path = inp.get("file_path")
                     tid = block.get("id") or f"anon-{len(order)}"
                     if tid in ops:
                         continue
                     ops[tid] = Operation(
-                        tool=name,
-                        path=inp["file_path"],
+                        tool=str(name),
+                        path=path if isinstance(path, str) else "",
                         tool_use_id=tid,
                         input=inp,
                         timestamp=rec.get("timestamp"),
@@ -210,6 +219,30 @@ def reconstruct(
     if not match_all:
         ops = [o for o in ops if path_matches(o.path, prefixes, markers)]
     return replay(ops)
+
+
+def errored_calls(
+    transcript: Path,
+    states: dict[str, FileState] | None = None,
+    include_subagents: bool = True,
+) -> list[Operation]:
+    """Every tool call that returned an error and is not already in ``states``.
+
+    This covers Bash and all other tools, plus failed file writes to paths
+    outside the scratchpad/tmp filter, so no error goes unseen.
+    """
+    covered = {o.tool_use_id for st in (states or {}).values() for o in st.operations}
+    return [
+        o
+        for o in collect_calls(transcript_files(transcript, include_subagents))
+        if o.is_error and o.tool_use_id not in covered
+    ]
+
+
+def tool_slug(tool: str) -> str:
+    """Folder name for a tool: 'Bash' -> 'bash', 'mcp__github__x' -> 'mcp__github__x'."""
+    slug = "".join(c if c.isalnum() or c in "-_." else "_" for c in tool.lower())
+    return slug.strip(".") or "unknown"
 
 
 def output_dir_for(path: str) -> PurePosixPath:

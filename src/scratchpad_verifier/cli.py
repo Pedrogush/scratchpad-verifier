@@ -6,15 +6,19 @@ import argparse
 import json
 import os
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import __version__
 from .transcript import (
     DEFAULT_MARKERS,
     DEFAULT_PREFIXES,
+    FILE_TOOLS,
     FileState,
+    Operation,
+    errored_calls,
     output_dir_for,
     reconstruct,
+    tool_slug,
     versioned_names,
 )
 
@@ -36,6 +40,7 @@ def _load(args: argparse.Namespace) -> dict[str, FileState]:
     markers = list(DEFAULT_MARKERS) + list(args.marker or [])
     transcript = resolve_transcript(args.transcript)
     args.session_id = transcript.stem
+    args.transcript_path = transcript
     return reconstruct(
         transcript,
         prefixes=prefixes,
@@ -51,8 +56,29 @@ def _status(st: FileState) -> str:
     return "partial" if st.problems else "ok"
 
 
+def _other_errors(args: argparse.Namespace, states: dict[str, FileState]) -> list[Operation]:
+    return errored_calls(args.transcript_path, states, include_subagents=not args.no_subagents)
+
+
+def _error_record(op: Operation) -> dict:
+    return {
+        "tool": op.tool,
+        "file_path": op.path or None,
+        "timestamp": op.timestamp,
+        "tool_use_id": op.tool_use_id,
+        "error": op.error,
+        "input": op.input,
+    }
+
+
+def _one_line(text: str | None, limit: int = 100) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     states = _load(args)
+    others = _other_errors(args, states)
     if args.json:
         out = [
             {
@@ -69,7 +95,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             }
             for st in states.values()
         ]
-        print(json.dumps(out, indent=2))
+        print(json.dumps({"files": out, "errored_calls": [_error_record(o) for o in others]}, indent=2))
         return 0
     for st in states.values():
         size = f"{len(st.content.encode()):>8}B" if st.content is not None else "       ?B"
@@ -78,6 +104,11 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"{_status(st):<8} {size}  v{len(st.versions):<3} {st.path}  [{ops}]")
     if not states:
         print("no matching files", file=sys.stderr)
+    if others:
+        print(f"\n{len(others)} other errored tool call(s):")
+        for o in others:
+            what = o.path or o.input.get("command") or json.dumps(o.input, ensure_ascii=False)
+            print(f"ERROR    {o.tool:<10} {_one_line(what, 70)}  ->  {_one_line(o.error, 60)}")
     return 0
 
 
@@ -101,6 +132,13 @@ def cmd_show(args: argparse.Namespace) -> int:
         if len(targets) > 1 and not st.content.endswith("\n"):
             sys.stdout.write("\n")
     return rc
+
+
+def _write_error(dest: Path, op: Operation, verbose: bool) -> None:
+    text = json.dumps(_error_record(op), indent=2, ensure_ascii=False) + "\n"
+    dest.write_text(text, encoding="utf-8")
+    if verbose:
+        print(dest)
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
@@ -129,19 +167,24 @@ def cmd_extract(args: argparse.Namespace) -> int:
             err_dir.mkdir(parents=True, exist_ok=True)
             names = versioned_names(st.path, len(failed))
             for name, op in zip(names, failed):
-                dest = err_dir / f"{name}.json"
-                record = {
-                    "tool": op.tool,
-                    "file_path": op.path,
-                    "timestamp": op.timestamp,
-                    "tool_use_id": op.tool_use_id,
-                    "error": op.error,
-                    "input": op.input,
-                }
-                dest.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                _write_error(err_dir / f"{name}.json", op, args.verbose)
                 errored += 1
-                if args.verbose:
-                    print(dest)
+
+    # Every other failed call: Bash and other tools grouped by tool name,
+    # file tools outside the path filter by their original path.
+    groups: dict[PurePosixPath, list[Operation]] = {}
+    for op in _other_errors(args, states):
+        if op.tool in FILE_TOOLS and op.path:
+            key = output_dir_for(op.path) / PurePosixPath(op.path.replace("\\", "/")).name
+        else:
+            key = PurePosixPath(tool_slug(op.tool), tool_slug(op.tool))
+        groups.setdefault(key, []).append(op)
+    for key, ops in groups.items():
+        err_dir = session_dir / "errored" / key.parent
+        err_dir.mkdir(parents=True, exist_ok=True)
+        for name, op in zip(versioned_names(key.name, len(ops)), ops):
+            _write_error(err_dir / f"{name}.json", op, args.verbose)
+            errored += 1
     print(
         f"wrote {count} file version(s) and {errored} errored call(s) to {session_dir}",
         file=sys.stderr,

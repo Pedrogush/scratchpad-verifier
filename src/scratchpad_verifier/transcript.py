@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator
 
 DEFAULT_PREFIXES = ("/tmp/",)
@@ -33,6 +33,9 @@ class FileState:
     path: str
     content: str | None = None
     operations: list[Operation] = field(default_factory=list)
+    # Content after each successful iteration, oldest first. If the first
+    # operation edited a pre-existing file, its original content comes first.
+    versions: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -130,7 +133,7 @@ def _apply_edit(content: str, old: str, new: str, replace_all: bool) -> str | No
 
 
 def replay(ops: Iterable[Operation]) -> dict[str, FileState]:
-    """Replay operations per file and return the reconstructed final states."""
+    """Replay operations per file and return the reconstructed states."""
     states: dict[str, FileState] = {}
     for op in ops:
         st = states.setdefault(op.path, FileState(path=op.path))
@@ -140,12 +143,14 @@ def replay(ops: Iterable[Operation]) -> dict[str, FileState]:
         if op.tool == "Write":
             st.content = op.input.get("content", "")
             st.problems.clear()
+            st.versions.append(st.content)
             continue
 
         if st.content is None:
             original = (op.result or {}).get("originalFile")
             if isinstance(original, str):
                 st.content = original
+                st.versions.append(original)
             else:
                 st.problems.append(
                     f"{op.tool} before any Write and no original content recorded"
@@ -156,17 +161,20 @@ def replay(ops: Iterable[Operation]) -> dict[str, FileState]:
             edits = [op.input]
         else:  # MultiEdit
             edits = op.input.get("edits") or []
+        content = st.content
         for edit in edits:
-            new = _apply_edit(
-                st.content,
+            content = _apply_edit(
+                content,
                 edit.get("old_string", ""),
                 edit.get("new_string", ""),
                 bool(edit.get("replace_all")),
             )
-            if new is None:
+            if content is None:
                 st.problems.append(f"{op.tool} old_string not found ({op.tool_use_id})")
                 break
-            st.content = new
+        if content is not None:
+            st.content = content
+            st.versions.append(content)
     return states
 
 
@@ -183,3 +191,25 @@ def reconstruct(
     if not match_all:
         ops = [o for o in ops if path_matches(o.path, prefixes, markers)]
     return replay(ops)
+
+
+def output_dir_for(path: str) -> PurePosixPath:
+    """Where a file goes under <session_id>/: scratchpad/..., tmp/... or other/..."""
+    parts = PurePosixPath(path.replace("\\", "/")).parts
+    if "scratchpad" in parts[:-1]:
+        idx = len(parts) - 1 - parts[::-1].index("scratchpad", 1)
+        return PurePosixPath("scratchpad", *parts[idx + 1 : -1])
+    if len(parts) > 1 and parts[0] == "/" and parts[1] == "tmp":
+        return PurePosixPath("tmp", *parts[2:-1])
+    rest = [p for p in parts[:-1] if p not in ("/",) and not p.endswith(":")]
+    return PurePosixPath("other", *rest)
+
+
+def versioned_names(path: str, count: int) -> list[str]:
+    """a.sh with 3 versions -> ['a_00.sh', 'a_01.sh', 'a_02.sh']."""
+    name = PurePosixPath(path.replace("\\", "/")).name
+    stem, dot, ext = name.rpartition(".")
+    if not stem:  # no extension, or a dotfile like ".env"
+        stem, dot, ext = name, "", ""
+    width = max(2, len(str(count - 1)))
+    return [f"{stem}_{i:0{width}d}{dot}{ext}" for i in range(count)]

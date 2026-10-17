@@ -4,9 +4,11 @@ A small, dependency-free Python CLI that reads a Claude Code session transcript
 (`~/.claude/projects/<project>/<session-id>.jsonl`) and reconstructs the files
 the agent wrote to `/tmp` and scratchpad directories during that session.
 
-It replays every `Write`, `Edit` and `MultiEdit` tool call in order, so you get
-the final content of each file even after the container or temp directory is
-gone, and can check whether what's on disk still matches what the agent wrote.
+It replays every `Write`, `Edit` and `MultiEdit` tool call in order and keeps a
+numbered copy of each file after every iteration, so you can see exactly how a
+script evolved between runs, even after the container or temp directory is
+gone. It can also check whether what's on disk still matches what the agent
+wrote.
 
 ## Install
 
@@ -32,13 +34,36 @@ scratchpad-verifier list 1234abcd --json
 scratchpad-verifier show 1234abcd /tmp/claude-0/.../scratchpad/plan.md
 scratchpad-verifier show 1234abcd
 
-# Write every reconstructed file into a directory, mirroring the original paths
+# Write every version of every file under ./recovered/<session_id>/
 scratchpad-verifier extract 1234abcd -o ./recovered
 
-# Compare with what's on disk; exits 1 if anything is MISSING / DIFFERS / UNKNOWN
+# Compare the final versions with what's on disk;
+# exits 1 if anything is MISSING / DIFFERS / UNKNOWN
 scratchpad-verifier verify 1234abcd
-scratchpad-verifier verify 1234abcd --root ./recovered
 ```
+
+### Output layout
+
+`extract` writes one file per iteration: the first `Write` is `_00`, and every
+later `Edit`, `MultiEdit` or overwriting `Write` adds the next number. Files are
+grouped by where they lived:
+
+```
+recovered/
+└── 1234abcd/                      # session id (transcript file name)
+    ├── scratchpad/                # paths inside .../scratchpad/
+    │   ├── plan_00.md
+    │   └── plan_01.md
+    └── tmp/                       # other paths under /tmp/
+        └── build/
+            ├── run_00.sh          # first Write
+            ├── run_01.sh          # after the first Edit
+            └── run_02.sh          # after the second Edit
+```
+
+Subdirectories below the scratchpad or `/tmp` are kept. Files matched only via
+`--prefix`, `--marker` or `--all` go under `other/<original path>`. If an edit
+targets a file that existed before the session, its original content is `_00`.
 
 `python -m scratchpad_verifier ...` works too.
 

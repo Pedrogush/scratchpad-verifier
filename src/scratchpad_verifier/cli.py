@@ -9,7 +9,14 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .transcript import DEFAULT_MARKERS, DEFAULT_PREFIXES, FileState, reconstruct
+from .transcript import (
+    DEFAULT_MARKERS,
+    DEFAULT_PREFIXES,
+    FileState,
+    output_dir_for,
+    reconstruct,
+    versioned_names,
+)
 
 
 def resolve_transcript(arg: str) -> Path:
@@ -27,8 +34,10 @@ def resolve_transcript(arg: str) -> Path:
 def _load(args: argparse.Namespace) -> dict[str, FileState]:
     prefixes = list(DEFAULT_PREFIXES) + list(args.prefix or [])
     markers = list(DEFAULT_MARKERS) + list(args.marker or [])
+    transcript = resolve_transcript(args.transcript)
+    args.session_id = transcript.stem
     return reconstruct(
-        resolve_transcript(args.transcript),
+        transcript,
         prefixes=prefixes,
         markers=markers,
         match_all=args.all,
@@ -50,6 +59,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "path": st.path,
                 "status": _status(st),
                 "operations": [o.tool for o in st.operations],
+                "versions": len(st.versions),
                 "bytes": len(st.content.encode()) if st.content is not None else None,
                 "problems": st.problems,
             }
@@ -60,7 +70,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     for st in states.values():
         size = f"{len(st.content.encode()):>8}B" if st.content is not None else "       ?B"
         ops = ",".join(o.tool for o in st.operations)
-        print(f"{_status(st):<8} {size}  {st.path}  [{ops}]")
+        print(f"{_status(st):<8} {size}  v{len(st.versions):<3} {st.path}  [{ops}]")
     if not states:
         print("no matching files", file=sys.stderr)
     return 0
@@ -90,19 +100,21 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_extract(args: argparse.Namespace) -> int:
     states = _load(args)
-    out_dir = Path(args.output)
+    session_dir = Path(args.output) / args.session_id
     count = 0
     for st in states.values():
-        if st.content is None:
+        if not st.versions:
             print(f"skip (unknown content): {st.path}", file=sys.stderr)
             continue
-        dest = out_dir / st.path.lstrip("/\\").replace(":", "")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(st.content, encoding="utf-8")
-        count += 1
-        if args.verbose:
-            print(dest)
-    print(f"wrote {count} file(s) to {out_dir}", file=sys.stderr)
+        dest_dir = session_dir / output_dir_for(st.path)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in zip(versioned_names(st.path, len(st.versions)), st.versions):
+            dest = dest_dir / name
+            dest.write_text(content, encoding="utf-8")
+            count += 1
+            if args.verbose:
+                print(dest)
+    print(f"wrote {count} file(s) to {session_dir}", file=sys.stderr)
     return 0
 
 
@@ -164,8 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("paths", nargs="*", help="file paths to print (default: all)")
     p.set_defaults(func=cmd_show)
 
-    p = sub.add_parser("extract", parents=[common], help="write files into a directory")
-    p.add_argument("-o", "--output", required=True, help="destination directory")
+    p = sub.add_parser(
+        "extract", parents=[common],
+        help="write every version of each file to OUTPUT/<session_id>/{scratchpad,tmp}/",
+    )
+    p.add_argument("-o", "--output", default=".", help="destination directory (default: .)")
     p.add_argument("-v", "--verbose", action="store_true", help="print each written path")
     p.set_defaults(func=cmd_extract)
 

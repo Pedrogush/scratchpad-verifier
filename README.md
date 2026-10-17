@@ -1,14 +1,16 @@
 # scratchpad-verifier
 
 A small, dependency-free Python CLI that reads a Claude Code session transcript
-(`~/.claude/projects/<project>/<session-id>.jsonl`) and reconstructs the files
-the agent wrote to `/tmp` and scratchpad directories during that session.
+(`~/.claude/projects/<project>/<session-id>.jsonl`) and pulls out everything
+the agent wrote or ran during that session: scratchpad and `/tmp` files,
+temporary files it created in the working directory and cleaned up, every
+shell command, every inline script, and every tool call that failed.
 
-It replays every `Write`, `Edit` and `MultiEdit` tool call in order and keeps a
-numbered copy of each file after every iteration, so you can see exactly how a
-script evolved between runs, even after the container or temp directory is
-gone. It can also check whether what's on disk still matches what the agent
-wrote.
+Agents create most files through the shell rather than the `Write` tool
+(`cat > f <<'EOF'`, `python - <<'EOF'`, `cp`, redirects), so the tool replays
+both: `Write`/`Edit`/`MultiEdit` calls and a static analysis of each `Bash` and
+`PowerShell` command. Every file gets a numbered copy per iteration, so you can
+see how a script evolved between runs even after the temp directory is gone.
 
 ## Install
 
@@ -52,95 +54,118 @@ Requires Python 3.9+. No runtime dependencies.
 
 The `TRANSCRIPT` argument is a path to a `.jsonl` file, or a bare session id
 (looked up under `~/.claude/projects/*/`, or `$CLAUDE_CONFIG_DIR/projects`).
+Subagent transcripts stored next to it (`<session-id>/subagents/*.jsonl`) are
+included automatically.
 
 ```bash
-# List reconstructed files (status, size, versions, tool calls) and failed calls
-scratchpad-verifier list ~/.claude/projects/-home-me-app/1234abcd.jsonl
+# Overview: files (category, status, versions), files commands produced,
+# command counts and failed tool calls
+scratchpad-verifier list 1234abcd
 scratchpad-verifier list 1234abcd --json
 
-# Print one file (or all of them, with headers)
+# Print one reconstructed file (or all of them, with headers)
 scratchpad-verifier show 1234abcd /tmp/claude-0/.../scratchpad/plan.md
-scratchpad-verifier show 1234abcd
 
-# Write every version of every file under ./recovered/<session_id>/
+# Write everything under ./recovered/<session_id>/
 scratchpad-verifier extract 1234abcd -o ./recovered
 
-# Compare the final versions with what's on disk;
+# Compare final versions with what's on disk;
 # exits 1 if anything is MISSING / DIFFERS / UNKNOWN
 scratchpad-verifier verify 1234abcd
 ```
 
-### Output layout
+`python -m scratchpad_verifier ...` works too.
 
-`extract` writes one file per iteration: the first `Write` is `_00`, and every
-later `Edit`, `MultiEdit` or overwriting `Write` adds the next number. Files are
-grouped by where they lived:
+### Output layout
 
 ```
 recovered/
-└── 1234abcd/                      # session id (transcript file name)
-    ├── scratchpad/                # paths inside .../scratchpad/
-    │   ├── plan_00.md
-    │   └── plan_01.md
-    ├── tmp/                       # other paths under /tmp/
-    │   └── build/
-    │       ├── run_00.sh          # first Write
-    │       ├── run_01.sh          # after the first Edit
-    │       └── run_02.sh          # after the second Edit
-    └── errored/                   # every tool call that returned an error
-        ├── tmp/build/
-        │   └── run_00.sh.json     # first failed Write/Edit on run.sh
-        ├── bash/
-        │   ├── bash_00.json       # failed Bash commands, in order
-        │   └── bash_01.json
-        ├── mcp__github__get_me/   # any other tool, one folder per tool name
-        └── other/home/me/app_00.py.json   # failed write outside /tmp & scratchpad
+└── 1234abcd/                          # session id (transcript file name)
+    ├── scratchpad/                    # files inside .../scratchpad/
+    │   ├── plan_00.md                 # first write
+    │   └── plan_01.md                 # after the next edit / rewrite
+    ├── tmp/                           # /tmp and other temp dirs
+    │   └── build/run_00.sh
+    ├── ran_from_root/                 # temp files created in the working
+    │   └── check_tmp_00.py            #   directory and deleted afterwards
+    ├── commands/                      # every Bash / PowerShell call, in order
+    │   ├── bash_0000.sh               #   (header: time, cwd, description, status)
+    │   └── bash_0001.sh
+    ├── inline_scripts/                # code run inline, named after its command
+    │   └── python3_0001.py            #   (python - <<EOF, python -c, node -e, ...)
+    ├── errored/                       # every tool call that returned an error
+    │   ├── scratchpad/plan_00.md.json #   failed Write/Edit, kept with the file
+    │   ├── bash/bash_00.json          #   failed commands, in order
+    │   └── mcp__github__get_me/...    #   any other tool, one folder per tool
+    ├── produced_without_content.tsv   # files commands wrote that can't be rebuilt
+    └── manifest.json                  # index of all of the above
 ```
 
-Each file in `errored/` is a JSON record of one failed tool call: the tool
-name, file path (if any), timestamp, the error message (for Bash: the exit
-code and output) and the full tool input (`command`, `content`,
-`old_string`/`new_string`, ...). Failed file writes are numbered per file and
-don't create a version; other failures are numbered per tool.
+**Versions.** The first write of a file is `_00`; every later `Write`, `Edit`,
+`MultiEdit`, heredoc, `echo >`/`>>` or `cp` onto it adds the next number. If
+the first change edits a file that existed before the session, its original
+content is `_00`.
 
-`list` marks failed file calls with `!` (e.g. `[Write,Edit!]`) and lists every
-other failed call, Bash included, below the files.
+**ran_from_root.** A file lands here when the session created it under the
+directory it started in (the transcript's `cwd`) and later removed it with
+`rm`, `del` or `Remove-Item`.
 
-Subdirectories below the scratchpad or `/tmp` are kept. Files matched only via
-`--prefix`, `--marker` or `--all` go under `other/<original path>`. If an edit
-targets a file that existed before the session, its original content is `_00`.
+**Errors.** Each file in `errored/` is a JSON record with the tool name, file
+path (if any), timestamp, cwd, the error message (for Bash: exit code and
+output) and the full tool input. Failed calls never create a version. Commands
+that failed after writing a file (e.g. `cat > t.py <<EOF ... && python t.py`)
+still count as writing it; commands the user denied don't.
 
-`python -m scratchpad_verifier ...` works too.
+**Produced without content.** Some files have no content in the transcript:
+what a `python - <<EOF` script wrote with `open(..., 'w')`, `.to_csv()` or
+`.save()`, output redirected from a program (`python x.py > out.log`), files a
+script on disk wrote (`python build.py`), `sed -i`, copies of unknown files.
+These are listed with the command that produced them, so they stay observable.
+
+### What's recognized in shell commands
+
+- heredocs: `cat > f <<'EOF'`, `cat <<EOF > f`, `cat <<EOF | tee [-a] f`
+- `echo`/`printf` with `>` or `>>`, `touch`
+- `cp` / `mv` (content follows the file when the source is known), `mkdir -p`
+- `rm`, `unlink`, `rmdir`, globs included
+- `cd` and `VAR=value` / `export VAR=value` earlier in the same command, so
+  `S=/tmp/x; cat > $S/a.py` and `cd dir && cat > a.py` resolve correctly
+- inline code: `python - <<EOF`, `python -c`, `node -e`, `bash -c`, `uv run python -`, ...
+- PowerShell: `Set-Content` / `Add-Content` / `Out-File` with here-strings,
+  `Remove-Item`
+
+Windows paths are normalized, so `C:\Users\...\scratchpad\a.md` (from `Write`)
+and `/c/Users/.../scratchpad/a.md` (from git-bash) are the same file.
 
 ### Which files are included
 
-By default, any path that starts with `/tmp/` or contains `/scratchpad/`.
-Widen the filter with:
+By default: scratchpad files, temp-dir files (`/tmp`, `/var/tmp`, macOS
+`/var/folders/.../T`, Windows `%TEMP%`) and `ran_from_root` files. Files
+written anywhere else (your repo, deliverables) are counted in `list` but only
+extracted when asked for:
 
 | Option | Effect |
 | --- | --- |
 | `--prefix PATH` | also include paths under `PATH` (repeatable) |
 | `--marker TEXT` | also include paths containing `TEXT` (repeatable) |
-| `--all` | include every file written in the session |
-| `--no-subagents` | skip subagent transcripts in `<session-id>/subagents/*.jsonl` |
+| `--all` | include every file written in the session, under `other/` |
+| `--no-subagents` | skip subagent transcripts |
 
 ### Status values
 
 - `ok`: content fully reconstructed.
-- `partial`: an `Edit` could not be applied (its `old_string` wasn't found), so
-  the content reflects the state before that edit.
+- `partial`: something changed the file in a way the transcript doesn't show
+  (a script, `sed -i`, an edit whose `old_string` didn't match), so the last
+  version is the last known content.
 - `unknown`: the file was only edited, never written, and the transcript did
   not record its original content.
 
-Tool calls whose result was an error are skipped. When an `Edit` targets a
-file that was never written in the session, the original content recorded in
-the tool result (`toolUseResult.originalFile`) is used as the starting point.
-
 ### Limitations
 
-Only the file tools are replayed. Files created through `Bash` (`echo >`,
-heredocs, scripts) or by programs the agent ran can't be reconstructed from the
-transcript, and won't appear in the output.
+This is static analysis: nothing is executed. Shell expansion in unquoted
+heredocs (`<<EOF`) is not applied (the version's `note` in `manifest.json`
+says so), loops and functions aren't followed, and binary files produced by
+programs (images, spreadsheets) are listed, not recovered.
 
 ## Development
 

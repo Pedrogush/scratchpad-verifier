@@ -6,13 +6,15 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from scratchpad_verifier.cli import main
-from scratchpad_verifier.transcript import output_dir_for, reconstruct, versioned_names
+from scratchpad_verifier.shell import analyze_bash, analyze_powershell
+from scratchpad_verifier.transcript import analyze, output_dir_for, reconstruct, versioned_names
 
 
-def tool_use(tid, name, inp, ts):
+def tool_use(tid, name, inp, ts, cwd=None):
     return {
         "type": "assistant",
         "timestamp": ts,
+        **({"cwd": cwd} if cwd else {}),
         "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": tid, "name": name, "input": inp},
         ]},
@@ -164,7 +166,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual((session / "tmp/run/a_01.sh").read_text(), "echo 2\n")
         self.assertEqual((session / "tmp/run/a_02.sh").read_text(), "echo 3\n")
         self.assertEqual((session / "scratchpad/notes_00.md").read_text(), "hello\n")
-        self.assertEqual(len(list(session.rglob("*.*"))), 4)
+        files = [p for p in session.rglob("*.*") if p.name != "manifest.json"]
+        self.assertEqual(len(files), 4)
 
     def test_extract_errored_calls(self):
         bad = {"file_path": "/tmp/run/a.sh", "old_string": "nope", "new_string": "x"}
@@ -210,6 +213,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads((err / "bash/bash_01.json").read_text())["input"]["command"], "make")
         rec = json.loads((err / "mcp__github__get_me/mcp__github__get_me_00.json").read_text())
         self.assertEqual(rec["error"], "401")
+        # Failed file writes are kept with the file, wherever it lives.
         rec = json.loads((err / "other/home/me/app_00.py.json").read_text())
         self.assertEqual(rec["error"], "denied")
 
@@ -236,6 +240,131 @@ class CliTests(unittest.TestCase):
         data = json.loads(out)["files"]
         self.assertEqual(data[0]["path"], SP)
         self.assertEqual(data[0]["status"], "ok")
+
+
+class ShellReplayTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.transcript = self.dir / "session.jsonl"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def bash(self, tid, command, ts, cwd="/repo", error=None):
+        return [
+            tool_use(tid, "Bash", {"command": command}, ts, cwd=cwd),
+            tool_result(tid, ts + "b", is_error=error is not None, text=error or "ok"),
+        ]
+
+    def test_heredoc_then_edit(self):
+        write_jsonl(self.transcript, [
+            *self.bash("b1", "cd /tmp/w && cat > run.sh <<'EOF'\necho 1\nEOF\nbash run.sh", "1"),
+            tool_use("e1", "Edit", {"file_path": "/tmp/w/run.sh", "old_string": "1", "new_string": "2"}, "2"),
+            tool_result("e1", "2b"),
+        ])
+        st = reconstruct(self.transcript)["/tmp/w/run.sh"]
+        self.assertEqual(st.versions, ["echo 1\n", "echo 2\n"])
+        self.assertEqual([v.how for v in st.history], ["heredoc", "Edit"])
+
+    def test_failed_command_still_writes_heredoc(self):
+        write_jsonl(self.transcript, [
+            *self.bash("b1", "cat > /tmp/t.py <<'EOF'\nraise SystemExit(1)\nEOF\npython /tmp/t.py",
+                       "1", error="Exit code 1"),
+        ])
+        self.assertEqual(reconstruct(self.transcript)["/tmp/t.py"].content, "raise SystemExit(1)\n")
+
+    def test_denied_command_is_not_replayed(self):
+        write_jsonl(self.transcript, [
+            *self.bash("b1", "echo hi > /tmp/x.txt", "1",
+                       error="The user doesn't want to proceed with this tool use."),
+        ])
+        self.assertNotIn("/tmp/x.txt", reconstruct(self.transcript))
+
+    def test_ran_from_root(self):
+        write_jsonl(self.transcript, [
+            tool_use("w1", "Write", {"file_path": "/repo/check_tmp.py", "content": "print(1)\n"}, "1", cwd="/repo"),
+            tool_result("w1", "1b", result={"type": "create", "originalFile": None}),
+            tool_use("w2", "Write", {"file_path": "/repo/src/app.py", "content": "app\n"}, "2", cwd="/repo"),
+            tool_result("w2", "2b", result={"type": "create", "originalFile": None}),
+            *self.bash("b1", "python check_tmp.py && rm check_tmp.py", "3"),
+        ])
+        session = analyze(self.transcript)
+        self.assertEqual(session.files["/repo/check_tmp.py"].category, "ran_from_root")
+        self.assertEqual(session.files["/repo/src/app.py"].category, "other")
+        out = self.dir / "out"
+        with redirect_stdout(io.StringIO()):
+            main(["extract", str(self.transcript), "-o", str(out)])
+        self.assertEqual((out / "session/ran_from_root/check_tmp_00.py").read_text(), "print(1)\n")
+        self.assertFalse((out / "session/other").exists())
+        self.assertIn("python check_tmp.py", (out / "session/commands/bash_0000.sh").read_text())
+
+    def test_inline_scripts_and_produced_files(self):
+        write_jsonl(self.transcript, [
+            *self.bash("b1", "S=/tmp/s/scratchpad; cd $S && python3 - <<'PY'\n"
+                       "import json\njson.dump({}, open('out.json', 'w'))\nPY", "1"),
+        ])
+        session = analyze(self.transcript)
+        self.assertEqual(len(session.scripts), 1)
+        self.assertIn("/tmp/s/scratchpad/out.json", session.produced)
+        out = self.dir / "out"
+        with redirect_stdout(io.StringIO()):
+            main(["extract", str(self.transcript), "-o", str(out)])
+        code = (out / "session/inline_scripts/python3_0000.py").read_text()
+        self.assertIn("json.dump", code)
+        manifest = json.loads((out / "session/manifest.json").read_text())
+        self.assertEqual(manifest["produced_without_content"][0]["path"], "/tmp/s/scratchpad/out.json")
+
+    def test_cp_copies_known_content(self):
+        write_jsonl(self.transcript, [
+            tool_use("w1", "Write", {"file_path": "/tmp/s/scratchpad/a.md", "content": "A"}, "1"),
+            *self.bash("b1", "mkdir -p /tmp/deliver && cp /tmp/s/scratchpad/a.md /tmp/deliver", "2"),
+        ])
+        self.assertEqual(reconstruct(self.transcript)["/tmp/deliver/a.md"].content, "A")
+
+    def test_windows_paths_merge(self):
+        win = "C:\\Users\\P\\AppData\\Local\\Temp\\claude\\x\\scratchpad\\a.md"
+        write_jsonl(self.transcript, [
+            tool_use("w1", "Write", {"file_path": win, "content": "one\n"}, "1", cwd="C:\\proj"),
+            *self.bash("b1", "echo two >> /c/Users/P/AppData/Local/Temp/claude/x/scratchpad/a.md", "2",
+                       cwd="C:\\proj"),
+        ])
+        files = reconstruct(self.transcript)
+        st = files["C:/Users/P/AppData/Local/Temp/claude/x/scratchpad/a.md"]
+        self.assertEqual(st.versions, ["one\n", "one\ntwo\n"])
+        self.assertEqual(str(output_dir_for(st.path, st.category)), "scratchpad")
+
+    def test_stream_json_events(self):
+        events = [
+            {"created_at": "1", "assistant": {"internal_anthropic_catchall": {
+                "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Write",
+                                         "input": {"file_path": "/tmp/e.txt", "content": "e"}}]}}}},
+            {"created_at": "2", "user": {"internal_anthropic_catchall": {
+                "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+                "tool_use_result": {"type": "create"}}}},
+        ]
+        write_jsonl(self.transcript, events)
+        self.assertEqual(reconstruct(self.transcript)["/tmp/e.txt"].content, "e")
+
+
+class ShellAnalysisTests(unittest.TestCase):
+    def test_patterns(self):
+        fx = analyze_bash(
+            "D=/tmp/d; mkdir -p $D\n"
+            "cat <<'EOF' | tee \"$D/notes.md\"\nhello\nEOF\n"
+            "(echo a; echo b) > $D/group.txt\n"
+            "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"\n"
+            "python3 -c \"open('$D/x.txt','w')\" && rm -rf $D/old 2>/dev/null",
+            "/w",
+        )
+        self.assertEqual([(w.path, w.content) for w in fx.writes], [("/tmp/d/notes.md", "hello\n")])
+        self.assertIn(("/tmp/d/group.txt", "output of a command group"), fx.produced)
+        self.assertEqual(fx.deletes, ["/tmp/d/old"])
+        self.assertEqual(len(fx.scripts), 1)
+
+    def test_powershell_here_string(self):
+        fx = analyze_powershell("Set-Content -Path C:\\Temp\\a.txt -Value @'\nhi\n'@", "C:\\w")
+        self.assertEqual([(w.path, w.content) for w in fx.writes], [("C:\\Temp\\a.txt", "hi\n")])
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@
 # into its scratchpad, makes random edits with hypothesis, and copies its
 # scratchpad and transcript into tests/meta/test_claude_code_sessions/. After
 # the session exits, the scratchpad and the complete transcript are copied
-# again, so the snapshot is exactly what was on disk when the session ended.
+# again, so the snapshot is exactly what was on disk when the session ended,
+# and a readable <id>.txt rendering of the transcript is written next to it.
 #
 # Usage: tests/meta/record_test_session.sh [scripts|inline ...]   (default: both)
 #
@@ -151,9 +152,48 @@ for r in records:
             b["content"] = REMOVED
             if isinstance(r.get("toolUseResult"), dict):
                 r["toolUseResult"] = {"stdout": REMOVED, "stderr": "", "interrupted": False}
+records = [scrub(r) for r in records]
 with open(out / f"{sid}.jsonl", "w", encoding="utf-8") as dst:
     for r in records:
-        dst.write(json.dumps(scrub(r), ensure_ascii=False) + "\n")
+        dst.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", f"[{b.get('type')}]") if isinstance(b, dict) else str(b)
+                         for b in content)
+    return json.dumps(content, ensure_ascii=False)
+
+def render(r):
+    """One readable section per message block, for the .txt transcript."""
+    who = "User" if r.get("type") == "user" else "Assistant"
+    content = (r.get("message") or {}).get("content")
+    if isinstance(content, str):
+        yield f"> {who}:\n{content}"
+        return
+    for b in content or []:
+        kind = b.get("type") if isinstance(b, dict) else None
+        if kind == "text":
+            yield f"> {who}:\n{b.get('text', '')}"
+        elif kind == "thinking" and b.get("thinking"):
+            yield f"> {who} (thinking):\n{b.get('thinking', '')}"
+        elif kind == "tool_use":
+            inputs = b.get("input") or {}
+            body = "\n".join(f"  {k}: {v}" if "\n" not in str(v) else f"  {k}:\n{v}"
+                             for k, v in inputs.items())
+            yield f"> Tool call {b.get('name')} ({b.get('id')}):\n{body}"
+        elif kind == "tool_result":
+            error = " [error]" if b.get("is_error") else ""
+            yield f"> Tool result ({b.get('tool_use_id')}){error}:\n{text_of(b.get('content'))}"
+
+# A plain-text rendering of the same (redacted) conversation, easier to read than the JSONL.
+with open(out / f"{sid}.txt", "w", encoding="utf-8") as dst:
+    dst.write(f"Session {sid} ({mode}), scratchpad {scratchpad}\n")
+    for r in records:
+        if r.get("type") in ("user", "assistant") and not r.get("isMeta"):
+            for section in render(r):
+                dst.write("\n" + section.rstrip() + "\n")
 subagents = transcript.with_suffix("") / "subagents"
 if subagents.is_dir():
     shutil.rmtree(dest / "subagents", ignore_errors=True)

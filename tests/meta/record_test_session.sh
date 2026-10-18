@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Record real Claude Code sessions for tests/meta/test_claude_code_sessions.py.
+#
+# Each mode starts a fresh headless session (`claude -p`) that clones this repo
+# into its scratchpad, makes random edits with hypothesis, and copies its
+# scratchpad and transcript into tests/meta/test_claude_code_sessions/. After
+# the session exits, the scratchpad and the complete transcript are copied
+# again, so the snapshot is exactly what was on disk when the session ended.
+#
+# Usage: tests/meta/record_test_session.sh [scripts|inline ...]   (default: both)
+#
+# Environment overrides:
+#   CLAUDE            claude executable              (default: claude)
+#   PYTHON            python executable              (default: python3, then python)
+#   REPO_URL          repository the session clones  (default: GitHub origin)
+#   CLAUDE_ARGS       extra arguments for claude, e.g. "--model sonnet"
+#
+# The sessions run Bash and file tools without asking (--allowedTools), in
+# this repository, on your machine. Run it only in a checkout you're happy
+# for an agent to work in, and review the recordings before committing them.
+set -euo pipefail
+
+REPO_ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+OUT="$REPO_ROOT/tests/meta/test_claude_code_sessions"
+CLAUDE=${CLAUDE:-claude}
+PYTHON=${PYTHON:-$(command -v python3 || command -v python)}
+REPO_URL=${REPO_URL:-https://github.com/Pedrogush/scratchpad-verifier}
+TOOLS="Bash Read Write Edit MultiEdit Glob Grep"
+
+modes=("$@")
+[ ${#modes[@]} -eq 0 ] && modes=(scripts inline)
+mkdir -p "$OUT"
+
+prompt_for() {
+  local mode=$1 sid=$2 how
+  case $mode in
+    scripts) how="For steps 1, 3 and 5, write the script as a file in your scratchpad and then run that file with a separate command. Use a different way of writing for each script, so every path you use to create and change files gets exercised:
+- step 1 script: create it with a Bash heredoc (cat > file <<'EOF'), then change it once with sed -i.
+- step 3 script: create it with the Write tool, then change it at least twice with the Edit tool (for example to add a print or a check) before its final run.
+- step 5 script: create it with the Write tool, then rewrite it fully once with the Write tool.
+Also copy the step 3 script to a backup file in the scratchpad with cp, then delete the backup with rm." ;;
+    inline) how="Run this inline, don't run a script: do steps 1, 3 and 5 by running the code directly in the Bash tool (plain shell commands, python - <<'EOF' heredocs, or python -c), never by saving a script file and executing it. Steps 2, 4 and 6 are simply running that inline code." ;;
+    *) echo "unknown mode: $mode (use scripts or inline)" >&2; exit 2 ;;
+  esac
+  cat <<EOF
+This is a recorded test session for the scratchpad-verifier tool. It checks that the tool can rebuild, from your transcript, every file you leave in your scratchpad directory. Below, SP means the absolute path of your scratchpad directory.
+
+Do these steps in order:
+1. Write a script that git clones $REPO_URL into SP/clone and then adds a git worktree of that clone at SP/worktree on a new branch named meta-test.
+2. Run that script.
+3. Write a script that deletes and edits files at random inside SP/worktree using the hypothesis library: use hypothesis strategies to choose 5 to 15 random tracked files and, for each, either delete it, append random text, or replace a random line. Use @settings(database=None) so hypothesis writes no cache, and print what it changed. Run Python with \`uv run --with hypothesis python\` if uv is installed, otherwise install hypothesis into a virtualenv at SP/.venv.
+4. Run that script, and then show \`git -C SP/worktree status --short\`.
+5. Write a script that copies SP (leaving out SP/clone, SP/worktree and SP/.venv) to tests/meta/test_claude_code_sessions/$sid/scratchpad/ in the current directory, and copies your session transcript to tests/meta/test_claude_code_sessions/$sid.jsonl. Your session id is $sid; the transcript is the file named $sid.jsonl under ~/.claude/projects/ (or \$CLAUDE_CONFIG_DIR/projects/).
+6. Run that script.
+
+$how
+
+Rules:
+- Keep every file you create inside SP, apart from the copies made in step 5.
+- After each step, add one line to SP/run_log.md saying what you did and whether it worked.
+- Don't read, change or commit anything else in the current repository.
+- Finish your final message with a line of the form SCRATCHPAD=<absolute path of SP>.
+EOF
+}
+
+for mode in "${modes[@]}"; do
+  sid=$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')
+  echo "== recording $mode session $sid"
+  # Unset the variables a parent Claude Code session sets, so this one starts clean.
+  (cd "$REPO_ROOT" && env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT \
+    "$CLAUDE" -p "$(prompt_for "$mode" "$sid")" --session-id "$sid" --output-format json \
+    --allowedTools $TOOLS ${CLAUDE_ARGS:-}) > "$OUT/$sid.result.json" || echo "!! claude exited with $?" >&2
+
+  "$PYTHON" - "$OUT" "$sid" "$mode" <<'PYEOF'
+"""Snapshot the scratchpad and transcript after the session ended."""
+import datetime, glob, json, os, re, shutil, subprocess, sys
+from pathlib import Path
+
+out, sid, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+result_file = out / f"{sid}.result.json"
+try:
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+except ValueError:
+    result = {}
+result_file.unlink(missing_ok=True)
+
+# Where the scratchpad was: the session reports it; fall back to the usual locations.
+m = re.search(r"^SCRATCHPAD=(.+)$", result.get("result") or "", re.M)
+scratchpad = m.group(1).strip().strip("`") if m else None
+if not scratchpad or not os.path.isdir(scratchpad):
+    found = glob.glob(f"/tmp/claude-*/*/{sid}/scratchpad") + glob.glob(
+        os.path.join(os.environ.get("TEMP", "/nonexistent"), "claude", "*", sid, "scratchpad"))
+    scratchpad = found[0] if found else scratchpad
+
+config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+transcripts = sorted((config / "projects").glob(f"*/{sid}.jsonl"))
+if not transcripts:
+    sys.exit(f"!! no transcript {sid}.jsonl under {config / 'projects'}")
+transcript = transcripts[0]
+
+dest = out / sid
+excluded = []
+
+def ignore(directory, names):
+    """Leave out git checkouts, virtualenvs and caches: programs wrote them, not the agent."""
+    skip = []
+    for name in names:
+        p = Path(directory, name)
+        if p.is_dir() and ((p / ".git").exists() or (p / "pyvenv.cfg").exists()
+                           or name in ("__pycache__", ".hypothesis", ".git")):
+            skip.append(name)
+            excluded.append(p.relative_to(scratchpad).as_posix())
+    return skip
+
+if scratchpad and os.path.isdir(scratchpad):
+    shutil.rmtree(dest / "scratchpad", ignore_errors=True)
+    shutil.copytree(scratchpad, dest / "scratchpad", ignore=ignore, symlinks=True)
+    source = "after session exit"
+elif (dest / "scratchpad").is_dir():
+    source = "copied by the session (scratchpad was gone after exit)"
+else:
+    sys.exit(f"!! scratchpad for {sid} not found; nothing to compare")
+
+shutil.copy2(transcript, out / f"{sid}.jsonl")
+subagents = transcript.with_suffix("") / "subagents"
+if subagents.is_dir():
+    shutil.rmtree(dest / "subagents", ignore_errors=True)
+    shutil.copytree(subagents, dest / "subagents")
+
+try:
+    version = subprocess.run([os.environ.get("CLAUDE", "claude"), "--version"],
+                             capture_output=True, text=True).stdout.strip()
+except OSError:
+    version = None
+meta = {
+    "session_id": sid,
+    "mode": mode,
+    "scratchpad": scratchpad,
+    "snapshot": source,
+    "excluded": sorted(excluded),
+    "claude_version": version,
+    "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    "num_turns": result.get("num_turns"),
+    "is_error": result.get("is_error"),
+    "permission_denials": len(result.get("permission_denials") or []),
+}
+(dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+print(f"   saved {dest} ({source})")
+PYEOF
+done
+
+echo "Compare with: python tests/meta/test_claude_code_sessions.py -v"

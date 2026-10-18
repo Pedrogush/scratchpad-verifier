@@ -1,0 +1,7 @@
+- Steps 1-2: cloned repo into SP/clone and added worktree SP/worktree on branch meta-test (inline) — worked
+- Steps 3-4: ran inline hypothesis script (uv run --with hypothesis) to delete/append/replace lines in random tracked files in SP/worktree — worked
+- Step 3-4 note: first run only used hypothesis's minimal example (deleted first 5 files) — not random enough; restoring worktree and rerunning
+- Steps 3-4 (rerun): inline hypothesis script used the last of 50 generated examples to delete/append/replace in random tracked files of SP/worktree; git status shown — worked
+- Steps 5-6: copied SP (excluding clone, worktree, .venv) to tests/meta/test_claude_code_sessions/b19e7ee4-8d75-4c6c-82fd-d30f7b0f9f3b/scratchpad/ and transcript to tests/meta/test_claude_code_sessions/b19e7ee4-8d75-4c6c-82fd-d30f7b0f9f3b.jsonl (inline) — worked
+- Steps 5-6 correction: previous line was premature — rsync is not installed so the scratchpad copy failed; redoing it with cp (transcript copy did work)
+- Steps 5-6 (retry): copied SP top-level entries except clone, worktree, .venv with cp -a, then copied transcript — worked

@@ -171,8 +171,10 @@ extracted when asked for:
 
 - `ok`: content fully reconstructed.
 - `partial`: something changed the file in a way the transcript doesn't show
-  (a script, `sed -i`, an edit whose `old_string` didn't match), so the last
-  version is the last known content.
+  (a script, `sed -i`, an edit whose `old_string` didn't match), or a write
+  may not have run as recorded (inside `if`/`else`, a loop, after `||`, after
+  `cmd &&` when `cmd` could have failed, or with a `$var` the command set
+  conditionally), so the last version is the last known content.
 - `unknown`: the file was only edited, never written, and the transcript did
   not record its original content.
 
@@ -188,6 +190,26 @@ programs (images, spreadsheets) are listed, not recovered.
 ```bash
 python -m unittest discover -s tests
 ```
+
+### Checking against real sessions
+
+`tests/meta/record_test_session.sh` starts headless Claude Code sessions
+(`claude -p`) that clone this repo into an empty scratchpad, edit it at random
+with hypothesis, and save the scratchpad and transcript under
+`tests/meta/test_claude_code_sessions/`. One session writes and revises its
+scripts as files (heredoc, Write, Edit, `sed -i`, `cp`, `rm`); the other runs
+everything inline. `tests/meta/test_claude_code_sessions.py` then checks
+every file left in each scratchpad: the tool must rebuild the same content
+(line endings aside) or at least list the file by name. A file it doesn't know
+about, or rebuilds wrongly, fails the test.
+
+```bash
+tests/meta/record_test_session.sh            # both modes; or: scripts / inline
+python tests/meta/test_claude_code_sessions.py -v
+```
+
+The sessions run Bash without asking, on your machine. Secrets in the saved
+transcripts are redacted, but review a recording before committing it.
 
 ## License
 

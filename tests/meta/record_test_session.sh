@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Record real Claude Code sessions for tests/meta/test_claude_code_sessions.py.
 #
-# Each mode starts a fresh headless session (`claude -p`) that clones this repo
+# Each mode starts a fresh headless session (`claude -p`) with its own empty
+# scratchpad directory. The session clones this repo
 # into its scratchpad, makes random edits with hypothesis, and copies its
 # scratchpad and transcript into tests/meta/test_claude_code_sessions/. After
 # the session exits, the scratchpad and the complete transcript are copied
@@ -17,7 +18,9 @@
 #
 # The sessions run Bash and file tools without asking (--allowedTools), in
 # this repository, on your machine. Run it only in a checkout you're happy
-# for an agent to work in, and review the recordings before committing them.
+# for an agent to work in. Lines that look like secrets (TOKEN=, KEY=, emails,
+# API keys) are redacted from the saved transcript, but still review the
+# recordings before committing them.
 set -euo pipefail
 
 REPO_ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -32,7 +35,7 @@ modes=("$@")
 mkdir -p "$OUT"
 
 prompt_for() {
-  local mode=$1 sid=$2 how
+  local mode=$1 sid=$2 sp=$3 how
   case $mode in
     scripts) how="For steps 1, 3 and 5, write the script as a file in your scratchpad and then run that file with a separate command. Use a different way of writing for each script, so every path you use to create and change files gets exercised:
 - step 1 script: create it with a Bash heredoc (cat > file <<'EOF'), then change it once with sed -i.
@@ -43,7 +46,9 @@ Also copy the step 3 script to a backup file in the scratchpad with cp, then del
     *) echo "unknown mode: $mode (use scripts or inline)" >&2; exit 2 ;;
   esac
   cat <<EOF
-This is a recorded test session for the scratchpad-verifier tool. It checks that the tool can rebuild, from your transcript, every file you leave in your scratchpad directory. Below, SP means the absolute path of your scratchpad directory.
+This is a recorded test session for the scratchpad-verifier tool. It checks that the tool can rebuild, from your transcript, every file you leave in your scratchpad directory.
+
+Your scratchpad for this session is SP=$sp (it exists and is empty). Use exactly this directory, even if your instructions name a different scratchpad.
 
 Do these steps in order:
 1. Write a script that git clones $REPO_URL into SP/clone and then adds a git worktree of that clone at SP/worktree on a new branch named meta-test.
@@ -59,38 +64,34 @@ Rules:
 - Keep every file you create inside SP, apart from the copies made in step 5.
 - After each step, add one line to SP/run_log.md saying what you did and whether it worked.
 - Don't read, change or commit anything else in the current repository.
-- Finish your final message with a line of the form SCRATCHPAD=<absolute path of SP>.
+- Don't print environment variables, credentials or anything outside SP and this repository.
 EOF
 }
 
 for mode in "${modes[@]}"; do
   sid=$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')
-  echo "== recording $mode session $sid"
+  # A fresh, empty scratchpad whose path names the session, like Claude Code's own.
+  sp="${TMPDIR:-/tmp}/scratchpad-verifier-meta/$sid/scratchpad"
+  mkdir -p "$sp"
+  command -v cygpath >/dev/null && sp=$(cygpath -m "$sp")  # git-bash: C:/... form
+  echo "== recording $mode session $sid in $sp"
   # Unset the variables a parent Claude Code session sets, so this one starts clean.
   (cd "$REPO_ROOT" && env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT \
-    "$CLAUDE" -p "$(prompt_for "$mode" "$sid")" --session-id "$sid" --output-format json \
-    --allowedTools $TOOLS ${CLAUDE_ARGS:-}) > "$OUT/$sid.result.json" || echo "!! claude exited with $?" >&2
+    "$CLAUDE" -p "$(prompt_for "$mode" "$sid" "$sp")" --session-id "$sid" --output-format json \
+    --allowedTools $TOOLS ${CLAUDE_ARGS:-} < /dev/null) > "$OUT/$sid.result.json" || echo "!! claude exited with $?" >&2
 
-  "$PYTHON" - "$OUT" "$sid" "$mode" <<'PYEOF'
+  "$PYTHON" - "$OUT" "$sid" "$mode" "$sp" <<'PYEOF'
 """Snapshot the scratchpad and transcript after the session ended."""
-import datetime, glob, json, os, re, shutil, subprocess, sys
+import datetime, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 
-out, sid, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+out, sid, mode, scratchpad = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 result_file = out / f"{sid}.result.json"
 try:
     result = json.loads(result_file.read_text(encoding="utf-8"))
 except ValueError:
     result = {}
 result_file.unlink(missing_ok=True)
-
-# Where the scratchpad was: the session reports it; fall back to the usual locations.
-m = re.search(r"^SCRATCHPAD=(.+)$", result.get("result") or "", re.M)
-scratchpad = m.group(1).strip().strip("`") if m else None
-if not scratchpad or not os.path.isdir(scratchpad):
-    found = glob.glob(f"/tmp/claude-*/*/{sid}/scratchpad") + glob.glob(
-        os.path.join(os.environ.get("TEMP", "/nonexistent"), "claude", "*", sid, "scratchpad"))
-    scratchpad = found[0] if found else scratchpad
 
 config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 transcripts = sorted((config / "projects").glob(f"*/{sid}.jsonl"))
@@ -112,7 +113,7 @@ def ignore(directory, names):
             excluded.append(p.relative_to(scratchpad).as_posix())
     return skip
 
-if scratchpad and os.path.isdir(scratchpad):
+if os.path.isdir(scratchpad):
     shutil.rmtree(dest / "scratchpad", ignore_errors=True)
     shutil.copytree(scratchpad, dest / "scratchpad", ignore=ignore, symlinks=True)
     source = "after session exit"
@@ -121,7 +122,38 @@ elif (dest / "scratchpad").is_dir():
 else:
     sys.exit(f"!! scratchpad for {sid} not found; nothing to compare")
 
-shutil.copy2(transcript, out / f"{sid}.jsonl")
+# Redact secrets in case the session printed its environment anyway.
+SECRET_LINE = re.compile(
+    r"(?im)^([\w.-]*(?:token|secret|key|passw|email|uuid|auth|credential|cookie)[\w.-]*)=.*$")
+SECRET_VALUE = re.compile(r"sk-ant-[\w-]+|gh[pousr]_\w{20,}|[\w.+-]+@[\w-]+\.[\w.]+")
+
+def scrub(value):
+    if isinstance(value, str):
+        return SECRET_VALUE.sub("[redacted]", SECRET_LINE.sub(r"\1=[redacted]", value))
+    if isinstance(value, list):
+        return [scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {k: scrub(v) for k, v in value.items()}
+    return value
+
+# Drop the whole output of commands that list the environment.
+ENV_COMMAND = re.compile(r"(^|[;&|(\s])(env|printenv|export -p|set)(\s*($|[|;&>]))")
+records = [json.loads(line) for line in open(transcript, encoding="utf-8") if line.strip()]
+env_ids = {
+    b.get("id") for r in records for b in ((r.get("message") or {}).get("content") or [])
+    if isinstance(b, dict) and b.get("type") == "tool_use"
+    and ENV_COMMAND.search(str((b.get("input") or {}).get("command", "")))
+}
+REMOVED = "[environment listing removed from the recording]"
+for r in records:
+    for b in (r.get("message") or {}).get("content") or []:
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in env_ids:
+            b["content"] = REMOVED
+            if isinstance(r.get("toolUseResult"), dict):
+                r["toolUseResult"] = {"stdout": REMOVED, "stderr": "", "interrupted": False}
+with open(out / f"{sid}.jsonl", "w", encoding="utf-8") as dst:
+    for r in records:
+        dst.write(json.dumps(scrub(r), ensure_ascii=False) + "\n")
 subagents = transcript.with_suffix("") / "subagents"
 if subagents.is_dir():
     shutil.rmtree(dest / "subagents", ignore_errors=True)

@@ -419,6 +419,7 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
     scripts: list[ScriptRun] = []
     reads: dict[str, str] = {}
     home = _guess_home(root, calls)
+    own_scratchpad = f"/{transcript.stem}/scratchpad/"
     env = {"HOME": home} if home else {}
 
     def state(path: str) -> FileState:
@@ -466,7 +467,10 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
             continue
         analyzer = analyze_powershell if op.tool == "PowerShell" else analyze_bash
         try:
-            effects = analyzer(command, op.cwd or root, env)
+            if analyzer is analyze_bash:
+                effects = analyzer(command, op.cwd or root, env, succeeded=not op.is_error)
+            else:
+                effects = analyzer(command, op.cwd or root, env)
         except Exception:  # never let one odd command break the whole replay
             continue
         for w in effects.writes:
@@ -474,6 +478,10 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
             st.operations.append(op)
             note = "shell expansion not applied" if w.expanded else ""
             if w.append:
+                if st.content is None and len(st.operations) == 1 and own_scratchpad in st.path:
+                    # The session's own scratchpad starts empty, so a first append creates the file.
+                    st.created = True
+                    st.content = ""
                 if st.content is None:
                     st.problems.append("appended to a file whose earlier content is unknown")
                     st.content = ""
@@ -483,6 +491,11 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
                 if not st.history:
                     st.created = True
                 st.content = w.content
+            if w.uncertain:
+                st.problems.append(
+                    f"{w.how} write in a branch, loop or with unresolved shell variables; may not match"
+                )
+                note = (note + "; " if note else "") + "may not have run as recorded"
             st.history.append(Version(st.content, w.how, op, note))
         for src, dst, move in getattr(effects, "copies", []):
             src_key = canonical(src, windows)

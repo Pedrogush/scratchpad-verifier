@@ -46,6 +46,9 @@ class ShellWrite:
     append: bool = False
     expanded: bool = False  # body may contain unexpanded $vars / $(...)
     how: str = ""
+    # The write may not have happened as recorded: it sits in an if/else branch,
+    # a loop or after ||, or its content has shell expansions we can't resolve.
+    uncertain: bool = False
 
 
 @dataclass
@@ -259,6 +262,12 @@ def _echo_content(args: list[str]) -> str | None:
 VAR_RE = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
 ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)$", re.S)
 NO_TARGET = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")
+OPENERS = {"if", "while", "until", "for", "case", "select"}
+CLOSERS = {"fi", "done", "esac"}
+BRANCHES = {"then", "else", "elif", "do", "!"}
+# Commands that practically never fail, so `cmd && write` after them still writes.
+SAFE_GATES = {"", "cd", "pushd", "mkdir", "echo", "printf", "cat", "touch", "export", "true", ":"}
+UNRESOLVED_RE = re.compile(r"\$[A-Za-z_{(]|`")
 
 
 def _expand(text: str, env: dict[str, str]) -> str:
@@ -266,7 +275,18 @@ def _expand(text: str, env: dict[str, str]) -> str:
     return VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), text)
 
 
-def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = None) -> ShellEffects:
+def _strip_keywords(words: list[str]) -> list[str]:
+    i = 0
+    while i < len(words) and words[i] in OPENERS | CLOSERS | BRANCHES:
+        i += 1
+    return words[i:]
+
+
+def analyze_bash(
+    command: str, cwd: str | None, env: dict[str, str] | None = None, succeeded: bool = False
+) -> ShellEffects:
+    """Static effects of a bash command. `succeeded`: the command exited 0, so its
+    last `a && b && c` chain ran to the end."""
     writes: list[ShellWrite] = []
     scripts: list[InlineScript] = []
     deletes: list[str] = []
@@ -286,9 +306,32 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
     flat, bodies = _extract_heredocs(command)
     segs = _segments(_split_words(_newlines_to_semicolons(flat)))
     skip_seg = -1
+    depth = 0          # inside if / loop / case bodies
+    after_or = False   # later in a chain that had ||
+    gated = False      # later in a chain, after `cmd &&` where cmd could have failed
+    last_chain = max([0] + [i + 1 for i, (_, sp) in enumerate(segs[:-1]) if sp not in ("&&", "||", "|")])
     for n, (words, sep) in enumerate(segs):
+        prev_sep = segs[n - 1][1] if n else ""
+        if prev_sep not in ("&&", "||", "|"):
+            after_or = gated = False
+        elif prev_sep == "||":
+            after_or = True
+        elif prev_sep == "&&" and _program(_strip_keywords(segs[n - 1][0]))[0] not in SAFE_GATES:
+            gated = True
         if n == skip_seg:
             continue
+        # Control keywords: strip them and remember that what follows may not run.
+        header = False
+        while words and words[0] in OPENERS | CLOSERS | BRANCHES:
+            kw = words.pop(0)
+            if kw in OPENERS:
+                depth += 1
+                header = kw in ("for", "case", "select")
+            elif kw in CLOSERS:
+                depth = max(0, depth - 1)
+        if header:
+            continue
+        conditional = depth > 0 or after_or or (gated and not (succeeded and n >= last_chain))
         # A ( ... ) or { ...; } group: its redirect applies to the whole group,
         # so we can't know the content.
         closes_group = any(
@@ -305,7 +348,10 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
         assigns = [m for w in lead if (m := ASSIGN_RE.match(w))]
         if assigns and len(assigns) == len(lead):
             for m in assigns:
-                env[m.group(1)] = _expand(m.group(2), env)
+                if conditional:  # value depends on which branch ran
+                    env.pop(m.group(1), None)
+                else:
+                    env[m.group(1)] = _expand(m.group(2), env)
             continue
 
         words = [w if MARKER_RE.match(w) else _expand(w, env) for w in words]
@@ -329,7 +375,8 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
                 target, append = _tee_target(segs[n + 1][0])
                 skip_seg = n + 1
             if prog in ("cat", "tee", "") and target and target not in NO_TARGET:
-                writes.append(ShellWrite(path(target), body, append, expanded, "heredoc"))
+                unsure = conditional or (expanded and bool(UNRESOLVED_RE.search(body)))
+                writes.append(ShellWrite(path(target), body, append, expanded, "heredoc", unsure))
                 continue
             if lang:
                 scripts.append(InlineScript(lang, body, prog, "heredoc"))
@@ -364,7 +411,9 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
             content = _echo_content(args) if prog == "echo" else _printf_content(args)
             if content is not None:
                 expanded = any("$" in a for a in args)
-                writes.append(ShellWrite(path(target), _expand(content, env), append, expanded, prog))
+                content = _expand(content, env)
+                unsure = conditional or bool(UNRESOLVED_RE.search(content))
+                writes.append(ShellWrite(path(target), content, append, expanded, prog, unsure))
                 continue
         if target:
             produced.append((path(target), f"output of {prog or 'command'}" + (" (appended)" if append else "")))
@@ -398,7 +447,7 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
                 produced.append((path(f), "edited in place by sed -i"))
         elif prog == "touch":
             for f in _plain_args(args):
-                writes.append(ShellWrite(path(f), "", False, False, "touch"))
+                writes.append(ShellWrite(path(f), "", False, False, "touch", conditional))
     return ShellEffects(writes, scripts, deletes, cur, copies, produced, executed)
 
 

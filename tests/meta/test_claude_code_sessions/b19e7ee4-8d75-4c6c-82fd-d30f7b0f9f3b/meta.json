@@ -1,0 +1,16 @@
+{
+  "session_id": "b19e7ee4-8d75-4c6c-82fd-d30f7b0f9f3b",
+  "mode": "inline",
+  "scratchpad": "/tmp/scratchpad-verifier-meta/b19e7ee4-8d75-4c6c-82fd-d30f7b0f9f3b/scratchpad",
+  "snapshot": "after session exit",
+  "excluded": [
+    ".hypothesis",
+    "clone",
+    "worktree"
+  ],
+  "claude_version": "2.1.303 (Claude Code)",
+  "recorded_at": "2026-10-18T23:26:21+00:00",
+  "num_turns": 7,
+  "is_error": false,
+  "permission_denials": 0
+}

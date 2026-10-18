@@ -408,6 +408,19 @@ class ShellReplayTests(unittest.TestCase):
         self.assertNotIn("/tmp/s/big.txt", reconstruct(self.transcript))
 
 
+    def test_first_append_in_own_scratchpad_creates_file(self):
+        own = f"/tmp/c/proj/{self.transcript.stem}/scratchpad/log.md"
+        other = "/tmp/c/proj/other-session/scratchpad/log.md"
+        write_jsonl(self.transcript, [
+            *self.bash("b1", f"echo one >> {own} && echo one >> {other}", "1"),
+            *self.bash("b2", f"echo two >> {own}", "2"),
+        ])
+        files = reconstruct(self.transcript)
+        self.assertTrue(files[own].complete)
+        self.assertEqual(files[own].content, "one\ntwo\n")
+        self.assertFalse(files[other].complete)
+
+
 class ShellAnalysisTests(unittest.TestCase):
     def test_patterns(self):
         fx = analyze_bash(
@@ -445,6 +458,24 @@ class ShellAnalysisTests(unittest.TestCase):
         self.assertEqual(fx.produced, [("C:\\Temp\\w\\log.txt", "output of python")])
         self.assertEqual(fx.copies, [("C:\\repo\\a.txt", "C:\\Temp\\w\\b.txt", False)])
         self.assertEqual(fx.deletes, ["C:\\repo\\tmp.ps1"])
+
+
+    def test_conditional_writes_are_uncertain(self):
+        fx = analyze_bash(
+            "if make; then\n  echo ok >> /tmp/log\nelse\n  echo bad >> /tmp/log\nfi\n"
+            "for f in a b; do echo x > /tmp/loop; done\n"
+            "[ -f x ] && r=yes || r=no\necho \"r=$r\" > /tmp/r\n"
+            "S=/tmp; echo fine > $S/sure\n"
+            "which rsync && echo a >> /tmp/gated\n"
+            "mkdir -p /tmp/d && echo b > /tmp/d/safe\n"
+            "make && echo c > /tmp/last",
+            "/w",
+            succeeded=True,
+        )
+        unsure = {w.path: w.uncertain for w in fx.writes}
+        self.assertEqual(unsure, {"/tmp/log": True, "/tmp/loop": True, "/tmp/r": True, "/tmp/sure": False,
+                                  "/tmp/gated": True, "/tmp/d/safe": False, "/tmp/last": False})
+        self.assertEqual(fx.produced, [])
 
 
 if __name__ == "__main__":

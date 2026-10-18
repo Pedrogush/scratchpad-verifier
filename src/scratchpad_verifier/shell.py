@@ -65,8 +65,8 @@ class ShellEffects:
     copies: list[tuple[str, str, bool]] = field(default_factory=list)  # (src, dst, is_move)
     # Files a command wrote whose content isn't in the transcript: (path, how).
     produced: list[tuple[str, str]] = field(default_factory=list)
-    # Script files the command ran: (path, lang, cwd at the time).
-    executed: list[tuple[str, str, str | None]] = field(default_factory=list)
+    # Script files the command ran: (path, lang, cwd at the time, argv).
+    executed: list[tuple] = field(default_factory=list)
 
 
 def _is_windows(path: str | None) -> bool:
@@ -75,8 +75,8 @@ def _is_windows(path: str | None) -> bool:
 
 def resolve(path: str, cwd: str | None) -> str:
     path = path.strip()
-    if path.startswith("~") or not cwd:
-        return path
+    if path.startswith(("~", "$")) or not cwd:
+        return path  # unknown home / variable: don't guess
     if path.startswith("/"):  # POSIX or git-bash (/c/...) absolute path
         return posixpath.normpath(path)
     if _is_windows(cwd) or _is_windows(path):
@@ -272,13 +272,16 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
     deletes: list[str] = []
     copies: list[tuple[str, str, bool]] = []
     produced: list[tuple[str, str]] = []
-    executed: list[tuple[str, str, str | None]] = []
+    executed: list[tuple] = []
     made_dirs: set[str] = set()
     cur = cwd
     env = dict(env or {})
 
     def path(word: str) -> str:
-        return resolve(_expand(word, env), cur)
+        word = _expand(word, env)
+        if word.startswith("~/") and env.get("HOME"):
+            word = env["HOME"].rstrip("/") + word[1:]
+        return resolve(word, cur)
 
     flat, bodies = _extract_heredocs(command)
     segs = _segments(_split_words(_newlines_to_semicolons(flat)))
@@ -305,10 +308,13 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
                 env[m.group(1)] = _expand(m.group(2), env)
             continue
 
+        words = [w if MARKER_RE.match(w) else _expand(w, env) for w in words]
         prog, args = _program(words)
         if prog in ("cd", "pushd") and args:
             cur = path(args[-1])
             continue
+        for out_path in _flag_outputs(words):
+            produced.append((path(out_path), f"output of {prog or 'command'} ({out_path})"))
 
         heredoc = next((int(m.group(1)) for w in words if (m := MARKER_RE.match(w))), None)
         target, append = _redirect_target(words)
@@ -327,7 +333,10 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
                 continue
             if lang:
                 scripts.append(InlineScript(lang, body, prog, "heredoc"))
-                produced.extend((resolve(p, cur), f"written by {prog} script") for p in script_outputs(body, lang))
+                argv = ["-"] + [_expand(a, env) for a in _plain_args(args) if a != "-" and not MARKER_RE.match(a)]
+                produced.extend(
+                    (path(p), f"written by {prog} script") for p in script_outputs(body, lang, argv)
+                )
             if target:
                 produced.append((path(target), f"output of {prog}"))
             continue
@@ -335,16 +344,19 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
         if lang and INLINE_FLAGS.get(lang) not in args:
             plain = [a for a in _plain_args(args) if a != "-"]
             if plain and "-m" not in args and not MARKER_RE.match(plain[0]):
-                executed.append((path(plain[0]), lang, cur))
+                executed.append((path(plain[0]), lang, cur, [path(a) for a in plain]))
         elif not lang and prog and re.search(r"\.(py|sh|js)$", words[0]) and "=" not in words[0]:
             ext = words[0].rsplit(".", 1)[-1]
-            executed.append((path(_expand(words[0], env)), {"py": "py", "sh": "sh", "js": "js"}[ext], cur))
+            script = path(words[0])
+            executed.append((script, {"py": "py", "sh": "sh", "js": "js"}[ext], cur,
+                             [script] + [path(a) for a in _plain_args(words[1:])]))
         if lang and INLINE_FLAGS.get(lang) in args:
             k = args.index(INLINE_FLAGS[lang])
             if k + 1 < len(args):
                 code = args[k + 1].rstrip("\n") + "\n"
                 scripts.append(InlineScript(lang, code, prog, "inline"))
-                produced.extend((resolve(p, cur), f"written by {prog} -c") for p in script_outputs(code, lang))
+                argv = ["-c"] + [_expand(a, env) for a in _plain_args(args[k + 2 :])]
+                produced.extend((path(p), f"written by {prog} -c") for p in script_outputs(code, lang, argv))
         if closes_group and target:
             produced.append((path(target), "output of a command group"))
             continue
@@ -358,6 +370,12 @@ def analyze_bash(command: str, cwd: str | None, env: dict[str, str] | None = Non
             produced.append((path(target), f"output of {prog or 'command'}" + (" (appended)" if append else "")))
         if prog in ("rm", "unlink", "rmdir"):
             for a in _plain_args(args):
+                deletes.append(path(a))
+        elif prog == "git" and args[:1] == ["rm"]:
+            for a in _plain_args(args[1:]):
+                deletes.append(path(a))
+        elif prog == "git" and args[:2] == ["worktree", "remove"]:
+            for a in _plain_args(args[2:]):
                 deletes.append(path(a))
         elif prog == "mkdir":
             for d in _plain_args(args):
@@ -391,7 +409,10 @@ SCRIPT_OUTPUT_RES = {
         # Path('x').write_text(...)
         re.compile(r"\bPath\(\s*[rf]?(['\"])([^'\"\n]+)\1\s*\)\.(?:write_text|write_bytes|open\(\s*['\"][wa])"),
         # df.to_csv('x'), plt.savefig('x'), wb.save('x'), ...
-        re.compile(r"\.(?:to_csv|to_json|to_excel|to_parquet|to_html|savefig|save|write_image|write_html|dump_to)\(\s*[rf]?(['\"])([^'\"\n]+)\1"),
+        re.compile(r"\.(?:to_csv|to_json|to_excel|to_parquet|to_html|savefig|save|SaveFile|write_image|"
+                   r"write_html|dump_to|screenshot|save_screenshot|imwrite|copyfile|copy2?|move)"
+                   r"\(\s*(?:path\s*=\s*)?[rf]?(['\"])([^'\"\n]+)\1"),
+        re.compile(r"\bshutil\.(?:copyfile|copy2?|move)\([^,\n]+,\s*[rf]?(['\"])([^'\"\n]+)\1"),
     ],
     "js": [
         re.compile(r"\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)\(\s*(['\"`])([^'\"`\n]+)\1"),
@@ -400,17 +421,22 @@ SCRIPT_OUTPUT_RES = {
 
 
 PY_CONST_RE = re.compile(r"^[ \t]*([A-Za-z_]\w*)\s*=\s*(?:Path\()?\s*[rf]?(['\"])([^'\"\n]+)\2\s*\)?[ \t]*(?:#.*)?$", re.M)
+PY_ARG = r"([A-Za-z_]\w*|sys\.argv\[\d+\])"
 PY_NAME_OUTPUT_RES = [
-    re.compile(r"\bopen\(\s*([A-Za-z_]\w*)\s*,\s*(?:mode\s*=\s*)?['\"][^'\"]*[wax]"),
-    re.compile(r"\.(?:to_csv|to_json|to_excel|to_parquet|to_html|savefig|save|write_image|write_html)\(\s*([A-Za-z_]\w*)\s*[,)]"),
+    re.compile(r"\bopen\(\s*" + PY_ARG + r"\s*,\s*(?:mode\s*=\s*)?['\"][^'\"]*[wax]"),
+    re.compile(r"\.(?:to_csv|to_json|to_excel|to_parquet|to_html|savefig|save|SaveFile|write_image|write_html|"
+               r"screenshot|save_screenshot|imwrite)\(\s*(?:path\s*=\s*)?" + PY_ARG + r"\s*[,)]"),
+    re.compile(r"\bshutil\.(?:copyfile|copy2?|move)\([^,\n]+,\s*" + PY_ARG + r"\s*[,)]"),
     re.compile(r"\b([A-Za-z_]\w*)\.(?:write_text|write_bytes)\("),
-    re.compile(r"\bPath\(\s*([A-Za-z_]\w*)\s*\)\.(?:write_text|write_bytes)"),
+    re.compile(r"\bPath\(\s*" + PY_ARG + r"\s*\)\.(?:write_text|write_bytes)"),
 ]
+PY_ARGV_ASSIGN_RE = re.compile(r"^[ \t]*([A-Za-z_][\w, \t]*?)\s*=\s*(?:Path\()?\s*sys\.argv\[(\d+)?(:?)(\d*)\]", re.M)
 
 
-def script_outputs(code: str, lang: str) -> list[str]:
-    """File paths a script writes to (best effort: literals and simple constants)."""
+def script_outputs(code: str, lang: str, argv: list[str] | None = None) -> list[str]:
+    """File paths a script writes to (best effort: literals, constants, sys.argv)."""
     found: list[str] = []
+    argv = argv or []
 
     def add(p: str | None) -> None:
         if p and p not in found and not p.startswith("/dev/") and "{" not in p:
@@ -421,6 +447,15 @@ def script_outputs(code: str, lang: str) -> list[str]:
             add(m.group(2))
     if lang == "py":
         consts = {m.group(1): m.group(3) for m in PY_CONST_RE.finditer(code)}
+        for i, a in enumerate(argv):
+            consts[f"sys.argv[{i}]"] = a
+        # dst = sys.argv[2]  /  src, dst = sys.argv[1:3]  /  src, dst = sys.argv[1:]
+        for m in PY_ARGV_ASSIGN_RE.finditer(code):
+            names = [n.strip() for n in m.group(1).split(",") if n.strip()]
+            start = int(m.group(2) or 0)
+            values = argv[start:] if m.group(3) else argv[start : start + 1]
+            for name, value in zip(names, values):
+                consts[name] = value
         for rx in PY_NAME_OUTPUT_RES:
             for m in rx.finditer(code):
                 value = consts.get(m.group(1))
@@ -429,15 +464,38 @@ def script_outputs(code: str, lang: str) -> list[str]:
     return found
 
 
+# Flags that name a file a program writes. --path only counts for commands
+# that look like they save something (screenshot --path x.png).
+OUTPUT_FLAGS = {"-o", "--output", "--out", "--outfile", "--output-file", "--out-file", "--save", "--save-to",
+                "--save-path", "--screenshot", "--dest", "--destination", "--report", "--junitxml", "--log-file"}
+SAVE_WORDS = re.compile(r"screenshot|save|export|dump|write|snapshot|capture|render", re.I)
+
+
+def _flag_outputs(words: list[str]) -> list[str]:
+    out = []
+    saving = any(SAVE_WORDS.search(w) for w in words if not w.startswith("-"))
+    for i, w in enumerate(words):
+        flag, eq, value = w.partition("=")
+        if flag in OUTPUT_FLAGS or (flag == "--path" and saving):
+            if not eq:
+                value = words[i + 1] if i + 1 < len(words) else ""
+            if value and not value.startswith("-") and not re.fullmatch(r"[<>&|]+", value) \
+                    and "." in value.rsplit("/", 1)[-1]:
+                out.append(value)
+    return out
+
+
 def _plain_args(args: list[str]) -> list[str]:
     """Positional arguments, without options or redirections."""
     out = []
     skip = False
-    for a in args:
+    for i, a in enumerate(args):
         if skip:
             skip = False
-        elif a in (">", ">>", "<", "2", "1"):
-            skip = a in (">", ">>", "<")
+        elif re.fullmatch(r"[<>&|]+", a):
+            skip = True  # >, >>, <, >&, &> and the target that follows
+        elif a.isdigit() and i + 1 < len(args) and re.fullmatch(r"[<>&]+", args[i + 1]):
+            continue  # the fd in 2>&1
         elif not a.startswith("-"):
             out.append(a)
     return out
@@ -459,51 +517,161 @@ PS_WRITE_RE = re.compile(
 )
 
 
-def _ps_path(args: str) -> str | None:
-    m = re.search(r"-(?:Path|FilePath|LiteralPath)\s+(?:'([^']+)'|\"([^\"]+)\"|(\S+))", args, re.I)
-    if m:
-        return m.group(1) or m.group(2) or m.group(3)
-    m = re.match(r"\s*(?:'([^']+)'|\"([^\"]+)\"|([^\s-]\S*))", args)
-    if m:
-        return m.group(1) or m.group(2) or m.group(3)
+PS_VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][\w:]*)\}|(env:[A-Za-z_]\w*|[A-Za-z_]\w*))")
+PS_ASSIGN_RE = re.compile(r"^\s*\$([A-Za-z_]\w*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')\s*$")
+PS_WRITERS = {"set-content": False, "add-content": True, "out-file": False, "tee-object": False}
+PS_COPIERS = {"copy-item": False, "cp": False, "copy": False, "cpi": False,
+              "move-item": True, "mv": True, "move": True, "mi": True}
+PS_REMOVERS = {"remove-item", "rm", "del", "ri", "erase", "rmdir", "rd"}
+
+
+def _ps_split(text: str) -> list[str]:
+    """Split on ; and newlines outside quotes."""
+    out, cur, quote = [], [], None
+    for c in text:
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif c in ";\n":
+            out.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    out.append("".join(cur))
+    return [s for s in out if s.strip()]
+
+
+def _ps_words(text: str) -> list[str]:
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars="<>|")
+        lex.whitespace_split = True
+        lex.escape = ""  # backslashes are path separators in PowerShell
+        lex.commenters = ""
+        return list(lex)
+    except ValueError:
+        return text.split()
+
+
+def _ps_param(args: list[str], *names: str) -> str | None:
+    lowered = [a.lower() for a in args]
+    for n in names:
+        if n in lowered:
+            i = lowered.index(n)
+            if i + 1 < len(args):
+                return args[i + 1]
     return None
 
 
-def analyze_powershell(command: str, cwd: str | None) -> ShellEffects:
+def _ps_positional(args: list[str]) -> list[str]:
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a.startswith("-"):
+            skip = a.lower() in ("-encoding", "-value", "-itemtype", "-filter", "-include", "-exclude", "-pattern")
+        elif not re.fullmatch(r"[<>|*0-9&]+", a):
+            out.append(a)
+    return out
+
+
+def analyze_powershell(command: str, cwd: str | None, env: dict[str, str] | None = None) -> ShellEffects:
     writes: list[ShellWrite] = []
     scripts: list[InlineScript] = []
     deletes: list[str] = []
+    copies: list[tuple[str, str, bool]] = []
+    produced: list[tuple[str, str]] = []
+    executed: list[tuple] = []
     cur = cwd
+    env = dict(env or {})
 
-    # Replace here-strings with placeholders so the rest can be scanned per line.
     strings: list[tuple[str, bool]] = []
 
     def stash(m: re.Match) -> str:
         strings.append((m.group(2) + "\n", m.group(1) == '"'))
         return f" __HERESTRING_{len(strings) - 1}__ "
 
+    def expand(text: str) -> str:
+        return PS_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), text)
+
+    def path(word: str) -> str:
+        return resolve(expand(word), cur)
+
     flat = PS_HERESTRING_RE.sub(stash, command)
-    for stmt in re.split(r"[;\n]", flat):
-        target = _cd_target(stmt.strip())
-        if target:
-            cur = resolve(target, cur)
-        m = PS_WRITE_RE.search(stmt)
+    for stmt in _ps_split(flat):
+        m = PS_ASSIGN_RE.match(stmt)
         if m:
-            path = _ps_path(m.group("args"))
-            hs = re.search(r"__HERESTRING_(\d+)__", stmt)
-            if path and hs:
-                body, expanded = strings[int(hs.group(1))]
-                writes.append(
-                    ShellWrite(resolve(path, cur), body, m.group(1).lower() == "add-content", expanded, m.group(1))
-                )
-        rm = re.match(r"\s*(Remove-Item|rm|del|ri)\s+(.*)", stmt, re.I)
-        if rm:
-            path = _ps_path(rm.group(2))
-            if path:
-                deletes.append(resolve(path, cur))
-        py = re.search(r"\b(python3?|py|node)(?:\.exe)?\s+-\s*$", stmt.split("|")[-1], re.I)
-        hs = re.search(r"__HERESTRING_(\d+)__\s*\|", stmt)
-        if hs and py:
-            scripts.append(InlineScript(_interp_lang(py.group(1).lower()) or "txt",
-                                        strings[int(hs.group(1))][0], py.group(1), "herestring"))
-    return ShellEffects(writes, scripts, deletes, cur)
+            value = m.group(2) if m.group(2) is not None else m.group(3)
+            env[m.group(1)] = expand(value) if m.group(2) is not None else value
+            continue
+        pipeline = [p for p in re.split(r"\|(?![|])", stmt)]
+        for k, part in enumerate(pipeline):
+            words = _ps_words(part)
+            if words and words[0] == "&":
+                words = words[1:]
+            if not words:
+                continue
+            words = [expand(w) if not w.startswith("__HERESTRING_") else w for w in words]
+            prog = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if prog.endswith(".exe"):
+                prog = prog[:-4]
+            args = words[1:]
+            hs = next((int(x.group(1)) for w in words if (x := re.match(r"__HERESTRING_(\d+)__", w))), None)
+            prev_hs = None
+            if k > 0:
+                prev = re.search(r"__HERESTRING_(\d+)__", pipeline[k - 1])
+                prev_hs = int(prev.group(1)) if prev else None
+
+            if prog in ("cd", "set-location", "sl", "push-location", "pushd") and args:
+                cur = path(_ps_positional(args)[-1] if _ps_positional(args) else args[-1])
+                continue
+            if prog in PS_WRITERS:
+                target = _ps_param(args, "-path", "-filepath", "-literalpath") or next(iter(_ps_positional(args)), None)
+                if target:
+                    src = hs if hs is not None else prev_hs
+                    if src is not None:
+                        body, expanded = strings[src]
+                        writes.append(ShellWrite(path(target), body, PS_WRITERS[prog], expanded, words[0]))
+                    else:
+                        produced.append((path(target), f"output of {words[0]}"))
+                continue
+            if prog in PS_COPIERS:
+                src = _ps_param(args, "-path", "-literalpath")
+                dst = _ps_param(args, "-destination")
+                pos = _ps_positional(args)
+                src = src or (pos[0] if pos else None)
+                dst = dst or (pos[1] if len(pos) > 1 else None)
+                if src and dst:
+                    copies.append((path(src), path(dst), PS_COPIERS[prog]))
+                continue
+            if prog in PS_REMOVERS:
+                target = _ps_param(args, "-path", "-literalpath") or next(iter(_ps_positional(args)), None)
+                if target:
+                    deletes.append(path(target))
+                continue
+            lang = _interp_lang(prog)
+            if lang:
+                flag = INLINE_FLAGS.get(lang)
+                if "-" in args and prev_hs is not None:
+                    scripts.append(InlineScript(lang, strings[prev_hs][0], prog, "herestring"))
+                    produced.extend((path(p), f"written by {prog} script") for p in script_outputs(strings[prev_hs][0], lang))
+                elif flag in args:
+                    i = args.index(flag)
+                    if i + 1 < len(args):
+                        code = args[i + 1].rstrip("\n") + "\n"
+                        scripts.append(InlineScript(lang, code, prog, "inline"))
+                        produced.extend((path(p), f"written by {prog} -c") for p in script_outputs(code, lang))
+                elif "-m" not in args:
+                    pos = _ps_positional(args)
+                    if pos:
+                        executed.append((path(pos[0]), lang, cur, [path(a) for a in pos]))
+            for out_path in _flag_outputs(words):
+                produced.append((path(out_path), f"output of {prog} ({out_path})"))
+            # Redirects: > file, >> file, *> file, 2> file
+            for i, w in enumerate(words):
+                if w in (">", ">>") and i + 1 < len(words):
+                    tgt = words[i + 1]
+                    if tgt.lower() not in ("$null", "nul") and not tgt.startswith("&"):
+                        produced.append((path(tgt), f"output of {prog}" + (" (appended)" if w == ">>" else "")))
+    return ShellEffects(writes, scripts, deletes, cur, copies, produced, executed)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import html
 import json
 import re
 from dataclasses import dataclass, field
@@ -21,13 +22,13 @@ _DRIVE = r"(?:[A-Za-z]:|/mnt/[A-Za-z]|/[A-Za-z])"
 TEMP_RE = re.compile(
     r"^(?:/tmp/|/var/tmp/|(?:/private)?/var/folders/[^/]+/[^/]+/T/"
     rf"|{_DRIVE}/(?:Temp|tmp)/|{_DRIVE}/Users/[^/]+/AppData/Local/Temp/"
-    rf"|{_DRIVE}/Windows/Temp/)",
+    rf"|{_DRIVE}/Windows/Temp/|\$\{{?(?:TMPDIR|TMP|TEMP)\}}?/)",
     re.I,
 )
 # Tool results meaning the command never ran.
 NOT_RUN_RE = re.compile(
     r"doesn't want to proceed|has been denied|was rejected|permission to use .* denied"
-    r"|interrupted by user|blocked by",
+    r"|interrupted by user|blocked by|ENAMETOOLONG|E2BIG|argument list too long",
     re.I,
 )
 
@@ -46,6 +47,7 @@ class Operation:
     is_error: bool = False
     error: str | None = None
     result: dict | None = None
+    output: str = ""          # text of the tool result
 
     @property
     def ran(self) -> bool:
@@ -232,8 +234,9 @@ def collect_calls(files: Iterable[Path]) -> list[Operation]:
                     if op.cwd is None:
                         op.cwd = rec.get("cwd")
                     op.is_error = bool(block.get("is_error"))
+                    op.output = _result_text(block.get("content"))
                     if op.is_error:
-                        op.error = _clean_error(_result_text(block.get("content")))
+                        op.error = _clean_error(op.output)
                     if isinstance(tur, dict):
                         op.result = tur
     result = [ops[t] for t in order]
@@ -273,7 +276,7 @@ def _norm(path: str) -> str:
     return path.replace("\\", "/")
 
 
-def _apply_file_tool(st: FileState, op: Operation) -> None:
+def _apply_file_tool(st: FileState, op: Operation, base: str | None = None) -> None:
     if op.tool == "Write":
         if not st.history:
             kind = (op.result or {}).get("type")
@@ -285,9 +288,11 @@ def _apply_file_tool(st: FileState, op: Operation) -> None:
 
     if st.content is None:
         original = (op.result or {}).get("originalFile")
+        if not isinstance(original, str):
+            original = base  # content seen by an earlier full Read
         if isinstance(original, str):
             st.content = original
-            st.history.append(Version(original, "original", op, "content before the session"))
+            st.history.append(Version(original, "original", op, "content before the first edit"))
         else:
             st.problems.append(f"{op.tool} before any Write and no original content recorded")
             return
@@ -328,6 +333,53 @@ def replay(ops: Iterable[Operation]) -> dict[str, FileState]:
     return states
 
 
+def _guess_home(root: str | None, calls: list[Operation]) -> str | None:
+    """The user's home directory, from the session cwd or paths the agent used."""
+    rx = re.compile(r"^((?:[A-Za-z]:|/mnt/[a-z]|/[a-z])/Users/[^/]+|/home/[^/]+|/Users/[^/]+|/root)(?:/|$)")
+    candidates = [root or ""] + [o.path for o in calls if o.path]
+    for c in candidates:
+        m = rx.match(c.replace("\\", "/"))
+        if m:
+            return m.group(1)
+    return None
+
+
+def _full_read(op: Operation) -> str | None:
+    """File content from a Read result that covered the whole file."""
+    r = op.result or {}
+    f = r.get("file") if r.get("type") == "text" else None
+    if not isinstance(f, dict) or not isinstance(f.get("content"), str):
+        return None
+    if (f.get("startLine") or 1) == 1 and f.get("numLines") == f.get("totalLines"):
+        return f["content"]
+    return None
+
+
+_PATH_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-~+@:/\\")
+
+
+def _scratchpad_mentions(text: str) -> list[str]:
+    """Absolute .../scratchpad/... file paths written in a block of text."""
+    found: list[str] = []
+    i = text.find("scratchpad")
+    while i != -1:
+        end = i + len("scratchpad")
+        if i > 0 and text[i - 1] in "/\\" and end < len(text) and text[end] in "/\\":
+            a = i
+            while a > 0 and text[a - 1] in _PATH_CHARS:
+                a -= 1
+            b = end
+            while b < len(text) and text[b] in _PATH_CHARS and text[b] != ":":
+                b += 1
+            path = text[a:b].rstrip(".:,")
+            last = path.replace("\\", "/").rsplit("/", 1)[-1]
+            absolute = path.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", path)
+            if absolute and "." in last.strip(".") and ":" not in path[2:] and path not in found:
+                found.append(path)
+        i = text.find("scratchpad", end)
+    return found
+
+
 def _is_windows_root(root: str | None) -> bool:
     return bool(root) and bool(re.match(r"^[A-Za-z]:[\\/]", root))
 
@@ -365,6 +417,9 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
     produced: dict[str, Produced] = {}
     commands: list[Operation] = []
     scripts: list[ScriptRun] = []
+    reads: dict[str, str] = {}
+    home = _guess_home(root, calls)
+    env = {"HOME": home} if home else {}
 
     def state(path: str) -> FileState:
         key = canonical(path, windows)
@@ -379,13 +434,28 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
             files[key].problems.append(f"later changed by a command ({how}); final content unknown")
 
     for op in calls:
+        if op.tool == "Read" and op.path and not op.is_error:
+            content = _full_read(op)
+            if content is None:
+                continue
+            key = canonical(op.path, windows)
+            reads[key] = content
+            st = files.get(key)
+            # A full Read shows the real content: if a command changed the file
+            # in a way we couldn't follow, record what the agent saw.
+            if st is not None and st.history and st.content != content:
+                st.content = content
+                st.problems.clear()
+                st.history.append(Version(content, "Read", op, "content observed by Read"))
+            continue
+
         if op.tool in FILE_TOOLS and op.path:
             st = state(op.path)
             st.operations.append(op)
             if not op.is_error:
                 if st.deleted and op.tool == "Write":
                     st.created = True
-                _apply_file_tool(st, op)
+                _apply_file_tool(st, op, reads.get(st.path))
             continue
 
         if op.tool not in SHELL_TOOLS:
@@ -396,7 +466,7 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
             continue
         analyzer = analyze_powershell if op.tool == "PowerShell" else analyze_bash
         try:
-            effects = analyzer(command, op.cwd or root)
+            effects = analyzer(command, op.cwd or root, env)
         except Exception:  # never let one odd command break the whole replay
             continue
         for w in effects.writes:
@@ -423,6 +493,8 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
                 target = dst_c.rstrip("/") + "/" + key.rsplit("/", 1)[-1] if _is_dir_target(dst_c, files) or len(sources) > 1 else dst_c
                 srcst = files.get(key)
                 how = "mv" if move else "cp"
+                if move and srcst is not None:
+                    srcst.deleted = True
                 if srcst is not None and srcst.content is not None:
                     st = state(target)
                     st.operations.append(op)
@@ -435,19 +507,19 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
         for s_ in effects.scripts:
             scripts.append(ScriptRun(s_, op, len(commands) - 1))
         # Script files run from disk (python build.py, bash x.sh): what they write.
-        for script_path, lang, run_cwd in getattr(effects, "executed", []):
+        for script_path, lang, run_cwd, argv in getattr(effects, "executed", []):
             st = files.get(canonical(script_path, windows))
             if st is None or st.content is None:
                 continue
             name = st.path.rsplit("/", 1)[-1]
             if lang == "sh":
                 try:
-                    inner = analyze_bash(st.content, run_cwd)
+                    inner = analyze_bash(st.content, run_cwd, env)
                 except Exception:
                     continue
                 outputs = [w.path for w in inner.writes] + [p for p, _ in inner.produced]
             else:
-                outputs = [resolve(p, run_cwd) for p in script_outputs(st.content, lang)]
+                outputs = [resolve(p, run_cwd) for p in script_outputs(st.content, lang, argv)]
             for out_path in outputs:
                 mark_produced(out_path, f"written by {name}", op)
         for path, how in getattr(effects, "produced", []):
@@ -458,6 +530,34 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
             for key, pr in produced.items():
                 if key == d or key.startswith(d.rstrip("/") + "/") or fnmatch.fnmatch(key, d):
                     pr.deleted = True
+
+    # Files programs created that we only know from their output (ls, logs,
+    # "saved to ..."): scratchpad paths that appear in tool results.
+    for op in commands:
+        for mentioned in _scratchpad_mentions(op.output):
+            key = canonical(mentioned, windows)
+            if key not in files and key not in produced:
+                mark_produced(key, "seen in command output", op)
+    # ...and paths the model wrote in its messages, or that background-task
+    # notifications report (their commands may live in another transcript).
+    for file in tfiles:
+        for rec in iter_records(file):
+            texts: list[tuple[str, str]] = []
+            msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+            if rec.get("type") == "assistant":
+                texts = [(b.get("text") or "", "mentioned by the model") for b in _content_blocks(rec)
+                         if isinstance(b, dict) and b.get("type") == "text"]
+            elif rec.get("type") == "user" and isinstance(msg.get("content"), str):
+                if "<task-notification>" in msg["content"]:
+                    texts = [(html.unescape(msg["content"]), "mentioned in a task notification")]
+            elif rec.get("type") == "queue-operation" and rec.get("operation") == "enqueue":
+                if isinstance(rec.get("content"), str) and "<task-notification>" in rec["content"]:
+                    texts = [(html.unescape(rec["content"]), "mentioned in a task notification")]
+            for text, how in texts:
+                for mentioned in _scratchpad_mentions(text):
+                    key = canonical(mentioned, windows)
+                    if key not in files and key not in produced:
+                        produced[key] = Produced(path=key, how=[how])
 
     for st in files.values():
         st.category = categorize(st, root)

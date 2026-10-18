@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from scratchpad_verifier.cli import main
-from scratchpad_verifier.shell import analyze_bash, analyze_powershell
+from scratchpad_verifier.shell import analyze_bash, analyze_powershell, script_outputs
 from scratchpad_verifier.transcript import analyze, output_dir_for, reconstruct, versioned_names
 
 
@@ -347,6 +347,67 @@ class ShellReplayTests(unittest.TestCase):
         self.assertEqual(reconstruct(self.transcript)["/tmp/e.txt"].content, "e")
 
 
+    def test_read_supplies_base_for_edits(self):
+        f = "/tmp/s/scratchpad/r.py"
+        write_jsonl(self.transcript, [
+            tool_use("r1", "Read", {"file_path": f}, "1"),
+            tool_result("r1", "1b", result={"type": "text", "file": {
+                "filePath": f, "content": "a = 1\n", "startLine": 1, "numLines": 1, "totalLines": 1}}),
+            tool_use("e1", "Edit", {"file_path": f, "old_string": "1", "new_string": "2"}, "2"),
+            tool_result("e1", "2b", result={"originalFile": None}),
+            *self.bash("b1", f"echo 'b = 3' >> {f}", "3"),
+            tool_use("r2", "Read", {"file_path": f}, "4"),
+            tool_result("r2", "4b", result={"type": "text", "file": {
+                "filePath": f, "content": "a = 9\n", "startLine": 1, "numLines": 1, "totalLines": 1}}),
+        ])
+        st = reconstruct(self.transcript)[f]
+        self.assertEqual(st.versions, ["a = 1\n", "a = 2\n", "a = 2\nb = 3\n", "a = 9\n"])
+        self.assertEqual(st.history[-1].how, "Read")
+
+    def test_edit_without_base_written_as_patch(self):
+        f = "/tmp/s/scratchpad/p.md"
+        write_jsonl(self.transcript, [
+            tool_use("e1", "Edit", {"file_path": f, "old_string": "x", "new_string": "y"}, "1"),
+            tool_result("e1", "1b", result={"originalFile": None, "structuredPatch": [
+                {"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-x", "+y"]}]}),
+        ])
+        out = self.dir / "out"
+        with redirect_stdout(io.StringIO()):
+            main(["extract", str(self.transcript), "-o", str(out)])
+        patch = (out / "session/scratchpad/p_00.md.patch").read_text()
+        self.assertIn("-x\n+y", patch)
+
+    def test_names_from_output_text_and_notifications(self):
+        sp = "/tmp/s/scratchpad"
+        write_jsonl(self.transcript, [
+            *self.bash("b1", "python run.py", "1"),
+            {"type": "user", "timestamp": "1c", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1", "content": f"saved {sp}/report.html"}]}},
+            {"type": "assistant", "timestamp": "2", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": f"Results are in `{sp}/summary.md`."}]}},
+            {"type": "queue-operation", "operation": "enqueue", "timestamp": "3",
+             "content": f"<task-notification>output: {sp}/agent_out.txt</task-notification>"},
+        ])
+        produced = analyze(self.transcript).produced
+        for name in ("report.html", "summary.md", "agent_out.txt"):
+            self.assertIn(f"{sp}/{name}", produced)
+
+    def test_script_argv_output(self):
+        write_jsonl(self.transcript, [
+            tool_use("w1", "Write", {"file_path": "/tmp/s/gen.py",
+                                     "content": "import sys\nopen(sys.argv[1], 'w').write('x')\n"}, "1"),
+            tool_result("w1", "1b"),
+            *self.bash("b1", "python /tmp/s/gen.py /tmp/s/out.csv", "2"),
+        ])
+        self.assertIn("/tmp/s/out.csv", analyze(self.transcript).produced)
+
+    def test_too_long_command_did_not_run(self):
+        write_jsonl(self.transcript, [
+            *self.bash("b1", "cat > /tmp/s/big.txt <<'EOF'\nx\nEOF", "1", error="spawn ENAMETOOLONG"),
+        ])
+        self.assertNotIn("/tmp/s/big.txt", reconstruct(self.transcript))
+
+
 class ShellAnalysisTests(unittest.TestCase):
     def test_patterns(self):
         fx = analyze_bash(
@@ -365,6 +426,25 @@ class ShellAnalysisTests(unittest.TestCase):
     def test_powershell_here_string(self):
         fx = analyze_powershell("Set-Content -Path C:\\Temp\\a.txt -Value @'\nhi\n'@", "C:\\w")
         self.assertEqual([(w.path, w.content) for w in fx.writes], [("C:\\Temp\\a.txt", "hi\n")])
+
+
+    def test_executed_scripts_flags_and_git_deletes(self):
+        fx = analyze_bash("python /tmp/x/gen.py /tmp/x/out.csv && npx shot --output /tmp/x/s.png"
+                          " && git worktree remove /tmp/wt && git rm tmp_a.py", "/repo")
+        self.assertEqual(fx.executed, [("/tmp/x/gen.py", "py", "/repo", ["/tmp/x/gen.py", "/tmp/x/out.csv"])])
+        self.assertEqual([p for p, _ in fx.produced], ["/tmp/x/s.png"])
+        self.assertEqual(fx.deletes, ["/tmp/wt", "/repo/tmp_a.py"])
+
+    def test_script_outputs_follow_argv(self):
+        code = "import sys\nout = sys.argv[2]\nwith open(out, 'w') as f:\n    f.write('x')\n"
+        self.assertEqual(script_outputs(code, "py", ["gen.py", "a", "/tmp/x/b.txt"]), ["/tmp/x/b.txt"])
+
+    def test_powershell_vars_redirects_copies(self):
+        fx = analyze_powershell('$d = "C:\\Temp\\w"\npython run.py > $d\\log.txt\n'
+                                'Copy-Item a.txt $d\\b.txt\nRemove-Item tmp.ps1', "C:\\repo")
+        self.assertEqual(fx.produced, [("C:\\Temp\\w\\log.txt", "output of python")])
+        self.assertEqual(fx.copies, [("C:\\repo\\a.txt", "C:\\Temp\\w\\b.txt", False)])
+        self.assertEqual(fx.deletes, ["C:\\repo\\tmp.ps1"])
 
 
 if __name__ == "__main__":

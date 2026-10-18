@@ -83,7 +83,8 @@ recovered/
 └── 1234abcd/                          # session id (transcript file name)
     ├── scratchpad/                    # files inside .../scratchpad/
     │   ├── plan_00.md                 # first write
-    │   └── plan_01.md                 # after the next edit / rewrite
+    │   ├── plan_01.md                 # after the next edit / rewrite
+    │   └── old_00.md.patch            # edit to a file whose content was never seen
     ├── tmp/                           # /tmp and other temp dirs
     │   └── build/run_00.sh
     ├── ran_from_root/                 # temp files created in the working
@@ -104,7 +105,11 @@ recovered/
 **Versions.** The first write of a file is `_00`; every later `Write`, `Edit`,
 `MultiEdit`, heredoc, `echo >`/`>>` or `cp` onto it adds the next number. If
 the first change edits a file that existed before the session, its original
-content is `_00`.
+content is `_00`. When the transcript doesn't record that original (newer
+Claude Code versions often don't), the last full `Read` of the file is used
+instead, and a `Read` that shows content different from what the replay
+expects (a script or formatter changed it) becomes a version of its own.
+Edits to a file whose content never appears are written as `.patch` files.
 
 **ran_from_root.** A file lands here when the session created it under the
 directory it started in (the transcript's `cwd`) and later removed it with
@@ -114,13 +119,20 @@ directory it started in (the transcript's `cwd`) and later removed it with
 path (if any), timestamp, cwd, the error message (for Bash: exit code and
 output) and the full tool input. Failed calls never create a version. Commands
 that failed after writing a file (e.g. `cat > t.py <<EOF ... && python t.py`)
-still count as writing it; commands the user denied don't.
+still count as writing it; commands the user denied, interrupted, or that were too long to start
+(`ENAMETOOLONG`) don't.
 
 **Produced without content.** Some files have no content in the transcript:
 what a `python - <<EOF` script wrote with `open(..., 'w')`, `.to_csv()` or
 `.save()`, output redirected from a program (`python x.py > out.log`), files a
 script on disk wrote (`python build.py`), `sed -i`, copies of unknown files.
 These are listed with the command that produced them, so they stay observable.
+
+The list also includes files known only by name: paths in a script's output
+flag (`--output`, `-o`, `--path` on screenshot/export commands), outputs of a
+script run with arguments (`python gen.py /tmp/out.csv` where `gen.py` writes
+`sys.argv[1]`), and scratchpad paths that appear in command output, in the
+model's own messages or in background-task notifications.
 
 ### What's recognized in shell commands
 
@@ -131,8 +143,12 @@ These are listed with the command that produced them, so they stay observable.
 - `cd` and `VAR=value` / `export VAR=value` earlier in the same command, so
   `S=/tmp/x; cat > $S/a.py` and `cd dir && cat > a.py` resolve correctly
 - inline code: `python - <<EOF`, `python -c`, `node -e`, `bash -c`, `uv run python -`, ...
-- PowerShell: `Set-Content` / `Add-Content` / `Out-File` with here-strings,
-  `Remove-Item`
+- `git rm`, `git worktree remove`
+- scripts run from a file (`python x.py`, `node x.js`, `bash x.sh`, `$PY x.py`):
+  the outputs that script writes are listed, with `sys.argv` filled in
+- PowerShell: `$var = "..."` and `$env:VAR`, `Set-Content` / `Add-Content` /
+  `Out-File` / `Tee-Object` with here-strings, `>` / `>>` redirects,
+  `Copy-Item` / `Move-Item`, `Remove-Item`
 
 Windows paths are normalized, so `C:\Users\...\scratchpad\a.md` (from `Write`)
 and `/c/Users/.../scratchpad/a.md` (from git-bash) are the same file.

@@ -126,7 +126,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         print("no matching files", file=sys.stderr)
     produced = _produced(session, args)
     if produced:
-        print(f"\n{len(produced)} file(s) written by commands, content not in the transcript:")
+        print(f"\n{len(produced)} file(s) known only by name (written by programs, or mentioned), "
+              "content not in the transcript:")
         for pr in produced:
             flag = " (deleted)" if pr.deleted else ""
             print(f"         {pr.category:<13} {pr.path}{flag}  [{_one_line('; '.join(dict.fromkeys(pr.how)), 60)}]")
@@ -180,6 +181,24 @@ class _Writer:
         return rel.as_posix()
 
 
+def _patch_text(op: Operation) -> str:
+    """A unified diff for an Edit, from its structuredPatch (or old/new strings)."""
+    path = op.path.replace("\\", "/")
+    lines = [f"--- a/{path}", f"+++ b/{path}"]
+    hunks = (op.result or {}).get("structuredPatch") or []
+    if hunks:
+        for h in hunks:
+            lines.append(f"@@ -{h.get('oldStart')},{h.get('oldLines')} +{h.get('newStart')},{h.get('newLines')} @@")
+            lines.extend(h.get("lines") or [])
+    else:
+        edits = [op.input] if op.tool == "Edit" else (op.input.get("edits") or [])
+        for e in edits:
+            lines.append("@@ edit @@")
+            lines.extend("-" + x for x in str(e.get("old_string", "")).splitlines())
+            lines.extend("+" + x for x in str(e.get("new_string", "")).splitlines())
+    return "\n".join(lines) + "\n"
+
+
 def _command_text(op: Operation, index: int, ext: str) -> str:
     c = "#"
     lines = [
@@ -222,6 +241,13 @@ def cmd_extract(args: argparse.Namespace) -> int:
             entry["versions"].append(
                 {"file": rel, "how": v.how, "timestamp": v.op.timestamp, "note": v.note or None}
             )
+        # Edits on a file whose content we never saw: keep them as patches.
+        if not st.history:
+            edits = [o for o in st.operations if o.tool in ("Edit", "MultiEdit") and not o.is_error]
+            entry["patches"] = []
+            for name, op in zip(versioned_names(st.path, len(edits)), edits):
+                rel = out.write(rel_dir / f"{name}.patch", _patch_text(op))
+                entry["patches"].append(rel)
         failed = st.errored
         for name, op in zip(versioned_names(st.path, len(failed)), failed):
             rel = out.write(

@@ -4,3 +4,4 @@ build/
 dist/
 .venv/
 .pytest_cache/
+tests/meta/test_claude_code_sessions/*/scratchpad_verifier_output_*/

@@ -220,7 +220,12 @@ def _command_text(op: Operation, index: int, ext: str) -> str:
 
 def cmd_extract(args: argparse.Namespace) -> int:
     session, files = _load(args)
-    out = _Writer(Path(args.output) / session.session_id, args.verbose)
+    return extract(session, files, args, Path(args.output) / session.session_id)
+
+
+def extract(session: Session, files: dict[str, FileState], args: argparse.Namespace, root: Path) -> int:
+    """Write files, commands, inline scripts and errors under root."""
+    out = _Writer(root, args.verbose)
     manifest: dict = {
         "session_id": session.session_id,
         "root": session.root,

@@ -10,23 +10,32 @@ A session passes when no file is missing and no rebuilt file differs. Content
 is compared after normalizing line endings (CRLF -> LF) and dropping a UTF-8
 BOM; files that only differ there are reported but pass.
 
+Each run also saves what `scratchpad-verifier extract` produces for every
+session in <id>/scratchpad_verifier_output_<datestamp>/, to inspect by hand.
+
 Run: python tests/meta/test_claude_code_sessions.py -v
 """
+import datetime
 import hashlib
+import os
 import json
 import re
 import sys
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
+    from scratchpad_verifier import cli
     from scratchpad_verifier.transcript import analyze, canonical
 except ImportError:  # running from a clone without installing
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    from scratchpad_verifier import cli
     from scratchpad_verifier.transcript import analyze, canonical
 
 RECORDINGS = Path(__file__).with_name("test_claude_code_sessions")
+STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def digest(data: bytes) -> str:
@@ -60,6 +69,16 @@ class Report:
                              ("listed by name", self.by_name), ("not on disk", self.absent)):
             lines += [f"    {label}: {p}" for p in items]
         return "\n".join(lines)
+
+
+def save_extract(transcript: Path) -> Path:
+    """Run `extract` with default options into <id>/scratchpad_verifier_output_<datestamp>/."""
+    args = cli.build_parser().parse_args(["extract", str(transcript)])
+    session, files = cli._load(args)
+    dest = RECORDINGS / transcript.stem / f"scratchpad_verifier_output_{STAMP}"
+    with open(os.devnull, "w") as quiet, redirect_stderr(quiet):
+        cli.extract(session, files, args, dest)
+    return dest
 
 
 def compare(transcript: Path) -> Report:
@@ -117,6 +136,7 @@ class RecordedSessionTests(unittest.TestCase):
             self.skipTest("no recordings; run tests/meta/record_test_session.sh")
         for transcript in transcripts:
             with self.subTest(session=transcript.stem):
+                save_extract(transcript)
                 report = compare(transcript)
                 print("\n" + report.summary(), file=sys.stderr)
                 self.assertEqual(report.missing, [], "files on disk the tool doesn't know about")

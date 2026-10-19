@@ -5,6 +5,8 @@ test_claude_code_sessions/: <id>.jsonl is the transcript and <id>/scratchpad/
 is a copy of the session's scratchpad taken after it ended. For every file in
 that copy, the tool must either rebuild the same content from the transcript,
 or at least list it by name when a program wrote it (git, a Python script).
+When the transcript can't tell whether a change ran, the tool keeps one branch
+per possible content; the file passes if one of them is what's on disk.
 
 A session passes when no file is missing and no rebuilt file differs. Content
 is compared after normalizing line endings (CRLF -> LF) and dropping a UTF-8
@@ -50,6 +52,7 @@ class Report:
     mode: str
     matched: list = field(default_factory=list)      # content rebuilt exactly
     line_endings: list = field(default_factory=list)  # rebuilt, differs only in CRLF/BOM
+    branched: list = field(default_factory=list)      # one of several possible versions matches
     by_name: list = field(default_factory=list)       # listed, content not in the transcript
     missing: list = field(default_factory=list)       # on disk, unknown to the tool
     differs: list = field(default_factory=list)       # rebuilt content is wrong
@@ -62,10 +65,11 @@ class Report:
     def summary(self) -> str:
         lines = [
             f"{self.session} ({self.mode}): {len(self.matched)} rebuilt, "
-            f"{len(self.line_endings)} rebuilt up to line endings, {len(self.by_name)} listed by name, "
+            f"{len(self.line_endings)} rebuilt up to line endings, {len(self.branched)} rebuilt on a branch, "
+            f"{len(self.by_name)} listed by name, "
             f"{len(self.missing)} missing, {len(self.differs)} differ, {len(self.absent)} not on disk",
         ]
-        for label, items in (("missing", self.missing), ("differs", self.differs),
+        for label, items in (("missing", self.missing), ("differs", self.differs), ("on a branch", self.branched),
                              ("listed by name", self.by_name), ("not on disk", self.absent)):
             lines += [f"    {label}: {p}" for p in items]
         return "\n".join(lines)
@@ -117,6 +121,14 @@ def compare(transcript: Path) -> Report:
                 report.line_endings.append(p)
             else:
                 report.differs.append(p)
+        elif st is not None and st.branches and len(st.branches) > 1:
+            data = digest(f.read_bytes())
+            if any(b.exact and digest(b.content.encode("utf-8")) == data for b in st.branches):
+                report.branched.append(p)
+            elif all(b.exact for b in st.branches):
+                report.differs.append(p)  # no possible version is the real one
+            else:
+                report.by_name.append(p)
         elif st is not None or p in produced:
             report.by_name.append(p)
         else:

@@ -84,6 +84,8 @@ recovered/
     ├── scratchpad/                    # files inside .../scratchpad/
     │   ├── plan_00.md                 # first write
     │   ├── plan_01.md                 # after the next edit / rewrite
+    │   ├── log_02_branch_0.md         # a change that may not have run: one file
+    │   ├── log_02_branch_1.md         #   per possible content (see Branches)
     │   └── old_00.md.patch            # edit to a file whose content was never seen
     ├── tmp/                           # /tmp and other temp dirs
     │   └── build/run_00.sh
@@ -110,6 +112,18 @@ Claude Code versions often don't), the last full `Read` of the file is used
 instead, and a `Read` that shows content different from what the replay
 expects (a script or formatter changed it) becomes a version of its own.
 Edits to a file whose content never appears are written as `.patch` files.
+
+**Branches.** When the transcript can't tell whether a change ran (a write or
+`sed -i` inside `if`/`else` or a loop, after `||`, or after `cmd &&` when `cmd`
+could have failed), the file forks: one branch where the change ran, one where
+it didn't, and every later change applies to each branch. Versions before the
+fork are written as usual; after it, each branch's final content is written as
+`<name>_<NN>_branch_<k>`, where `NN` is the first uncertain version. Branch 0
+assumes everything ran. `manifest.json` lists each branch's `choices` (e.g.
+`"skipped: echo in command 4"`, numbered like `commands/`). A fork closes
+again when a full `Read` or a later `cat` shows which branch is real, when an
+`Edit` succeeds whose `old_string` only one branch contains, or when the file
+is overwritten. `verify` accepts a file that matches any branch.
 
 **ran_from_root.** A file lands here when the session created it under the
 directory it started in (the transcript's `cwd`) and later removed it with
@@ -174,13 +188,14 @@ extracted when asked for:
 ### Status values
 
 - `ok`: content fully reconstructed.
+- `branched`: some changes may not have run, so the file has several possible
+  contents (see Branches above).
 - `partial`: something changed the file in a way the transcript doesn't show
-  (a script, `sed -i`, an edit whose `old_string` didn't match), or a write
-  may not have run as recorded (inside `if`/`else`, a loop, after `||`, after
-  `cmd &&` when `cmd` could have failed, or with a `$var` the command set
-  conditionally), so the last version is the last known content. When a later
-  `cat` of the file (or a full `Read`) prints content that fits only one of
-  the possibilities, that content is used and the file is `ok` again.
+  (a script, a `sed -i` script that can't be replayed, an edit whose
+  `old_string` didn't match), or its content has a `$var` / `$(...)` whose
+  value is unknown, so the last version is the last known content. A later
+  `cat` of the file (or a full `Read`) that fits only one possibility makes it
+  `ok` again.
 - `unknown`: the file was only edited, never written, and the transcript did
   not record its original content.
 

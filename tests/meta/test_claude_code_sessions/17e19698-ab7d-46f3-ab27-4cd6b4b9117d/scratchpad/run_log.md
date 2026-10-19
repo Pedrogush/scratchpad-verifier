@@ -1,0 +1,6 @@
+- Step 1: wrote inline shell code to clone the repo into SP/clone and add worktree SP/worktree on new branch meta-test (worked)
+- Step 2: ran it; clone and worktree created, worktree on meta-test at 3a50297 (worked)
+- Step 3: wrote inline hypothesis code (uv run --with hypothesis, database=None) to delete/append/replace 5-15 random tracked files in SP/worktree (worked)
+- Step 4: ran it; it deleted .github/workflows/tests.yml, .gitignore, LICENSE, README.md, pyproject.toml, confirmed by git status (worked)
+- Step 5: wrote inline python to copy SP (excluding clone, worktree, .venv) and the session transcript into tests/meta/test_claude_code_sessions/ (worked)
+- Step 6: ran the copy; scratchpad and transcript copied into tests/meta/test_claude_code_sessions/ (worked if this line appears in the copy)

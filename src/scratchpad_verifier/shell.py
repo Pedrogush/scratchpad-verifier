@@ -7,6 +7,7 @@ creates files or runs code from a shell command:
 * simple redirects: ``echo "text" > f``
 * inline scripts: ``python - <<'EOF'``, ``python -c "..."``, ``node -e "..."``
 * PowerShell: ``Set-Content``/``Out-File``/``Add-Content`` with here-strings
+* in-place edits: ``sed -i`` (replayed by ``sed.py``)
 * deletions: ``rm``, ``del``, ``Remove-Item``
 
 Unquoted heredocs (``<<EOF``) would be expanded by the shell; their body is
@@ -20,6 +21,9 @@ import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field
+from typing import Callable
+
+from .sed import parse_in_place
 
 INTERPRETERS = {
     "python": "py", "python3": "py", "py": "py", "pypy3": "py",
@@ -53,6 +57,9 @@ class ShellWrite:
     # expansion goes. None when the content is fully known.
     parts: list | None = None
     conditional: bool = False  # it may not have run at all
+    # An in-place edit (sed -i): new content = transform(old content).
+    transform: Callable[[str], str] | None = None
+    backup: str | None = None  # where the edit saved the old content (sed -i.bak)
 
 
 @dataclass
@@ -563,10 +570,18 @@ def analyze_bash(
             t, _ = _tee_target(words)
             if t:
                 produced.append((path(t), "output of tee"))
-        elif prog == "sed" and any(a.startswith("-i") for a in args):
-            plain = _plain_args([a for a in args if not a.startswith("-")])
-            for f in plain[1:]:
-                produced.append((path(f), "edited in place by sed -i"))
+        elif prog == "sed" and (sed := parse_in_place([_lit(a) for a in _strip_redirects(args)])):
+            # A script that still has shell expansions in it can't be replayed.
+            raw_script = " ".join(args)
+            edit = None if UNRESOLVED_RE.search(raw_script) else sed.edit
+            for f in sed.files:
+                target = path(f)
+                if edit is None:
+                    produced.append((target, "edited in place by sed -i"))
+                    continue
+                writes.append(ShellWrite(target, "", how="sed -i", uncertain=conditional,
+                                         conditional=conditional, transform=edit,
+                                         backup=target + sed.backup_suffix if sed.backup_suffix else None))
         elif prog == "touch":
             for f in _plain_args(args):
                 writes.append(ShellWrite(path(f), "", False, False, "touch", conditional, conditional=conditional))

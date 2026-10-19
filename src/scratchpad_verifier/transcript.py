@@ -474,6 +474,32 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
         except Exception:  # never let one odd command break the whole replay
             continue
         for w in effects.writes:
+            if w.transform is not None:
+                st = files.get(canonical(w.path, windows))
+                new = None
+                if st is not None and st.content is not None:
+                    try:
+                        new = w.transform(st.content)
+                    except Exception:
+                        new = None
+                if new is None:
+                    mark_produced(w.path, "edited in place by sed -i", op)
+                    continue
+                if w.backup:
+                    bst = state(w.backup)
+                    bst.operations.append(op)
+                    bst.created = bst.created or not bst.history
+                    bst.content = st.content
+                    bst.problems = list(st.problems)
+                    bst.history.append(Version(st.content, "sed -i backup", op, f"backup of {st.path}"))
+                st.operations.append(op)
+                st.content = new
+                note = ""
+                if w.conditional:
+                    st.problems.append("sed -i in a branch, loop or after ||; may not have run")
+                    note = "may not have run as recorded"
+                st.history.append(Version(new, w.how, op, note))
+                continue
             st = state(w.path)
             st.operations.append(op)
             note = "shell expansion not applied" if w.expanded else ""

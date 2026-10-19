@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from scratchpad_verifier.cli import main
+from scratchpad_verifier.sed import parse_in_place
 from scratchpad_verifier.shell import analyze_bash, analyze_powershell, script_outputs
 from scratchpad_verifier.transcript import analyze, output_dir_for, reconstruct, versioned_names
 
@@ -506,6 +507,67 @@ class ShellAnalysisTests(unittest.TestCase):
             ("/tmp/p", "one\ntwo\n"), ("/tmp/p", "n=5%\n"), ("/tmp/e", "a\tb\n"), ("/tmp/n", "a\\tb"),
         ])
         self.assertIn(("/tmp/wide", "output of printf"), fx.produced)
+
+
+class SedTests(unittest.TestCase):
+    def sed(self, args, content):
+        edit = parse_in_place(["-i", *args, "f"])
+        self.assertIsNotNone(edit.edit, args)
+        self.assertEqual(edit.files, ["f"])
+        return edit.edit(content)
+
+    def test_substitutions(self):
+        text = "a.b a.b\nfoo(1)\nlast"
+        self.assertEqual(self.sed(["s/a\\.b/X/"], text), "X a.b\nfoo(1)\nlast")
+        self.assertEqual(self.sed(["s/a.b/X/g"], text), "X X\nfoo(1)\nlast")
+        self.assertEqual(self.sed(["s/a.b/X/2"], text), "a.b X\nfoo(1)\nlast")
+        self.assertEqual(self.sed(["s|(1)|[&]|"], text), "a.b a.b\nfoo[(1)]\nlast")
+        self.assertEqual(self.sed(["s/\\(fo*\\)(\\([0-9]\\))/\\2\\1/"], text), "a.b a.b\n1foo\nlast")
+        self.assertEqual(self.sed(["-E", "s/(fo+)\\(([[:digit:]])\\)/\\2-\\1/"], text), "a.b a.b\n1-foo\nlast")
+        self.assertEqual(self.sed(["s/^last$/end/"], text), "a.b a.b\nfoo(1)\nend")
+        self.assertEqual(self.sed(["s/A\\.B/y/I"], "a.b\n"), "y\n")
+        self.assertEqual(self.sed(["s/\\//-/g"], "a/b/c\n"), "a-b-c\n")
+        self.assertEqual(self.sed(["-e", "s/a/b/", "-e", "s/b/c/"], "a\n"), "c\n")
+        self.assertEqual(self.sed(["s/a/b/; s/b/c/"], "a\n"), "c\n")
+
+    def test_addresses_and_commands(self):
+        text = "1\n2\n3\n4\n5\n"
+        self.assertEqual(self.sed(["2d"], text), "1\n3\n4\n5\n")
+        self.assertEqual(self.sed(["2,4d"], text), "1\n5\n")
+        self.assertEqual(self.sed(["/3/,$d"], text), "1\n2\n")
+        self.assertEqual(self.sed(["$!d"], text), "5\n")
+        self.assertEqual(self.sed(["/[24]/s/$/!/"], text), "1\n2!\n3\n4!\n5\n")
+        self.assertEqual(self.sed(["3a after"], text), "1\n2\n3\nafter\n4\n5\n")
+        self.assertEqual(self.sed(["1i\\\nfirst"], text), "first\n1\n2\n3\n4\n5\n")
+        self.assertEqual(self.sed(["2,3c\\\nmid"], text), "1\nmid\n4\n5\n")
+
+    def test_unsupported_and_backup(self):
+        self.assertIsNone(parse_in_place(["s/a/b/", "f"]))  # not in place
+        self.assertIsNone(parse_in_place(["-i", "s/a/\\U&/", "f"]).edit)
+        self.assertIsNone(parse_in_place(["-n", "-i", "s/a/b/p", "f"]).edit)
+        self.assertIsNone(parse_in_place(["-i", "N;s/a/b/", "f"]).edit)
+        edit = parse_in_place(["-i.bak", "s/a/b/", "x", "y"])
+        self.assertEqual((edit.files, edit.backup_suffix), (["x", "y"], ".bak"))
+        self.assertEqual(parse_in_place(["-i", "", "s/a/b/", "x"]).files, ["x"])
+
+    def test_heredoc_then_sed_in_one_command(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        transcript = Path(tmp.name) / "s.jsonl"
+        write_jsonl(transcript, [
+            tool_use("b1", "Bash", {"command":
+                "SP=/tmp/sp/scratchpad\ncat > \"$SP/run.sh\" <<'EOF'\necho \"done\"\nEOF\n"
+                "sed -i.orig 's/^echo \"done\"$/echo \"ready at $SP\"/' \"$SP/run.sh\"\n"
+                "sed -i \"s/$UNKNOWN/x/\" \"$SP/run.sh\".orig"}, "1", cwd="/w"),
+            tool_result("b1", "1b"),
+        ])
+        files = reconstruct(transcript)
+        st = files["/tmp/sp/scratchpad/run.sh"]
+        self.assertEqual(st.content, 'echo "ready at $SP"\n')
+        self.assertEqual([v.how for v in st.history], ["heredoc", "sed -i"])
+        self.assertTrue(st.complete)
+        self.assertEqual(files["/tmp/sp/scratchpad/run.sh.orig"].content, 'echo "done"\n')
+        self.assertFalse(files["/tmp/sp/scratchpad/run.sh.orig"].complete)
 
 
 if __name__ == "__main__":

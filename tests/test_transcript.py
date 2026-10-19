@@ -509,6 +509,58 @@ class ShellAnalysisTests(unittest.TestCase):
         self.assertIn(("/tmp/wide", "output of printf"), fx.produced)
 
 
+class ObservedContentTests(unittest.TestCase):
+    LOG = "/tmp/sp/scratchpad/log.md"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.transcript = Path(self.tmp.name) / "s.jsonl"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_commands(self, *commands):
+        records = []
+        for i, (command, output) in enumerate(commands):
+            records += [tool_use(f"b{i}", "Bash", {"command": command}, f"{i}", cwd="/w"),
+                        tool_result(f"b{i}", f"{i}b", text=output)]
+        write_jsonl(self.transcript, records)
+        return reconstruct(self.transcript)[self.LOG]
+
+    def test_later_cat_settles_gated_appends_and_variables(self):
+        st = self.run_commands(
+            (f"echo start > {self.LOG}\nmake && echo built >> {self.LOG}\n"
+             f"which rsync && echo synced >> {self.LOG}\n"
+             f"[ -f x ] && r=yes || r=no\necho \"x: $r\" >> {self.LOG}\ntrue", ""),
+            (f"cat {self.LOG}; ls", "start\nbuilt\nx: no\nfile_a\nfile_b"),
+        )
+        self.assertEqual(st.content, "start\nbuilt\nx: no\n")
+        self.assertTrue(st.complete)
+        self.assertEqual(st.history[-1].how, "observed")
+
+    def test_cat_before_the_write_does_not_settle_it(self):
+        st = self.run_commands(
+            (f"echo start > {self.LOG}", ""),
+            (f"cat {self.LOG}; make && echo built >> {self.LOG}\ntrue", "start"),
+        )
+        self.assertFalse(st.complete)
+
+    def test_ambiguous_output_does_not_settle_it(self):
+        st = self.run_commands(
+            (f"echo \"r=$(date)\" > {self.LOG}\ntrue", ""),
+            (f"cat {self.LOG} other.txt", "r=Mon\nr=Tue"),
+        )
+        self.assertFalse(st.complete)
+
+    def test_copy_keeps_uncertainty(self):
+        st = self.run_commands(
+            (f"echo start > {self.LOG}\nmake && echo built >> {self.LOG}\n"
+             f"cp {self.LOG} /tmp/sp/scratchpad/copy.md\ntrue", ""),
+        )
+        self.assertFalse(reconstruct(self.transcript)["/tmp/sp/scratchpad/copy.md"].complete)
+        self.assertFalse(st.complete)
+
+
 class SedTests(unittest.TestCase):
     def sed(self, args, content):
         edit = parse_in_place(["-i", *args, "f"])

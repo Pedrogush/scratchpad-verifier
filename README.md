@@ -103,7 +103,7 @@ recovered/
 ```
 
 **Versions.** The first write of a file is `_00`; every later `Write`, `Edit`,
-`MultiEdit`, heredoc, `echo >`/`>>` or `cp` onto it adds the next number. If
+`MultiEdit`, heredoc, `echo >`/`>>`, `sed -i` or `cp` onto it adds the next number. If
 the first change edits a file that existed before the session, its original
 content is `_00`. When the transcript doesn't record that original (newer
 Claude Code versions often don't), the last full `Read` of the file is used
@@ -125,7 +125,8 @@ still count as writing it; commands the user denied, interrupted, or that were t
 **Produced without content.** Some files have no content in the transcript:
 what a `python - <<EOF` script wrote with `open(..., 'w')`, `.to_csv()` or
 `.save()`, output redirected from a program (`python x.py > out.log`), files a
-script on disk wrote (`python build.py`), `sed -i`, copies of unknown files.
+script on disk wrote (`python build.py`), `sed -i` scripts that can't be
+replayed, copies of unknown files.
 These are listed with the command that produced them, so they stay observable.
 
 The list also includes files known only by name: paths in a script's output
@@ -137,7 +138,10 @@ model's own messages or in background-task notifications.
 ### What's recognized in shell commands
 
 - heredocs: `cat > f <<'EOF'`, `cat <<EOF > f`, `cat <<EOF | tee [-a] f`
-- `echo`/`printf` with `>` or `>>`, `touch`
+- `echo` (`-n`, `-e`) / `printf` (`%s`, `%b`, `%d`) with `>` or `>>`, `touch`
+- `sed -i` edits, replayed on the known content: `s` (flags `g`, `N`, `I`, `p`),
+  `d`, `p`, `a`/`i`/`c`, with line, `$`, `/regex/` and range addresses; basic and
+  extended (`-E`) regexes, `-e`, `-i.bak` backups
 - `cp` / `mv` (content follows the file when the source is known), `mkdir -p`
 - `rm`, `unlink`, `rmdir`, globs included
 - `cd` and `VAR=value` / `export VAR=value` earlier in the same command, so
@@ -174,7 +178,9 @@ extracted when asked for:
   (a script, `sed -i`, an edit whose `old_string` didn't match), or a write
   may not have run as recorded (inside `if`/`else`, a loop, after `||`, after
   `cmd &&` when `cmd` could have failed, or with a `$var` the command set
-  conditionally), so the last version is the last known content.
+  conditionally), so the last version is the last known content. When a later
+  `cat` of the file (or a full `Read`) prints content that fits only one of
+  the possibilities, that content is used and the file is `ok` again.
 - `unknown`: the file was only edited, never written, and the transcript did
   not record its original content.
 

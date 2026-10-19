@@ -75,6 +75,8 @@ class FileState:
     created: bool = False     # first known write created it (vs. editing an existing file)
     deleted: bool = False     # removed with rm / del / Remove-Item at some point
     category: str = "other"   # scratchpad, tmp, ran_from_root or other
+    # While the content is uncertain: what it can be, as pieces (see _template_regex).
+    template: list | None = None
 
     @property
     def versions(self) -> list[str]:
@@ -405,6 +407,46 @@ def _is_dir_target(dst: str, files: dict) -> bool:
     return any(k.startswith(prefix) for k in files)
 
 
+# Templates describe a file whose content is only partly known. A piece is a
+# literal string, None for the output of an unresolved expansion (within one
+# line), or ("alt", a, b): content a, or else content b (both piece lists),
+# for a write that may not have run.
+
+
+def _template_of(st: FileState) -> list | None:
+    if st.template is not None:
+        return st.template
+    return [st.content] if st.content is not None else None
+
+
+def _has_unknowns(template: list) -> bool:
+    return any(not isinstance(p, str) for p in template)
+
+
+def _template_regex(template: list) -> str:
+    out = []
+    for p in template:
+        if isinstance(p, str):
+            out.append(re.escape(p))
+        elif p is None:
+            out.append(r"[^\n]*?")
+        else:
+            out.append(f"(?:{_template_regex(p[1])}|{_template_regex(p[2])})")
+    return "".join(out)
+
+
+def _observed_content(template: list, output: str) -> str | None:
+    """The file's content, if output shows it in exactly one way that fits the template."""
+    rx = re.compile(r"(?m)^" + _template_regex(template) + r"(?:(?<=\n)|(?=\n|\Z))")
+    if rx.fullmatch(""):
+        return None  # everything optional: any output "matches"
+    text = output.replace("\r\n", "\n")
+    if not text.endswith("\n"):
+        text += "\n"  # tool results drop the final newline
+    found = {m.group(0) for m in rx.finditer(text) if m.group(0)}
+    return found.pop() if len(found) == 1 else None
+
+
 def analyze(transcript: Path, include_subagents: bool = True) -> Session:
     """Replay file tools and shell commands from a transcript, in order."""
     tfiles = transcript_files(transcript, include_subagents)
@@ -433,6 +475,7 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
         pr.ops.append(op)
         if key in files:
             files[key].problems.append(f"later changed by a command ({how}); final content unknown")
+            files[key].template = None
 
     for op in calls:
         if op.tool == "Read" and op.path and not op.is_error:
@@ -444,10 +487,12 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
             st = files.get(key)
             # A full Read shows the real content: if a command changed the file
             # in a way we couldn't follow, record what the agent saw.
-            if st is not None and st.history and st.content != content:
+            if st is not None and st.history and (st.content != content or st.problems):
+                if st.content != content:
+                    st.history.append(Version(content, "Read", op, "content observed by Read"))
                 st.content = content
                 st.problems.clear()
-                st.history.append(Version(content, "Read", op, "content observed by Read"))
+                st.template = None
             continue
 
         if op.tool in FILE_TOOLS and op.path:
@@ -457,6 +502,7 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
                 if st.deleted and op.tool == "Write":
                     st.created = True
                 _apply_file_tool(st, op, reads.get(st.path))
+                st.template = None
             continue
 
         if op.tool not in SHELL_TOOLS:
@@ -473,7 +519,26 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
                 effects = analyzer(command, op.cwd or root, env)
         except Exception:  # never let one odd command break the whole replay
             continue
+        pending = sorted(getattr(effects, "observed", []))
+
+        def observe() -> None:
+            """A cat printed whole files: settle uncertain ones whose template fits."""
+            for st in files.values():
+                if st.template is None:
+                    continue
+                seen = _observed_content(st.template, op.output)
+                if seen is None:
+                    continue
+                if seen != st.content:
+                    st.history.append(Version(seen, "observed", op, "content printed by a later command"))
+                st.content = seen
+                st.problems.clear()
+                st.template = None
+
         for w in effects.writes:
+            if pending and pending[0] < w.seg:
+                observe()
+                pending = [s for s in pending if s >= w.seg]
             if w.transform is not None:
                 st = files.get(canonical(w.path, windows))
                 new = None
@@ -494,6 +559,7 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
                     bst.history.append(Version(st.content, "sed -i backup", op, f"backup of {st.path}"))
                 st.operations.append(op)
                 st.content = new
+                st.template = None  # can't edit a template; problems stay
                 note = ""
                 if w.conditional:
                     st.problems.append("sed -i in a branch, loop or after ||; may not have run")
@@ -503,27 +569,38 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
             st = state(w.path)
             st.operations.append(op)
             note = "shell expansion not applied" if w.expanded else ""
+            new = w.parts if w.parts is not None else [w.content]
             if w.append:
                 if st.content is None and len(st.operations) == 1 and own_scratchpad in st.path:
                     # The session's own scratchpad starts empty, so a first append creates the file.
                     st.created = True
                     st.content = ""
+                base = _template_of(st)
                 if st.content is None:
                     st.problems.append("appended to a file whose earlier content is unknown")
                     st.content = ""
                     note = (note + "; " if note else "") + "earlier content unknown"
                 st.content = st.content + w.content
+                template = None if base is None else base + ([("alt", new, [])] if w.conditional else new)
             else:
                 if not st.history:
                     st.created = True
+                old = _template_of(st)
+                if w.conditional:
+                    template = None if old is None else [("alt", new, old)]
+                else:
+                    template = new
+                    st.problems.clear()  # overwritten: earlier unknowns no longer matter
                 st.content = w.content
-                st.problems.clear()  # overwritten: earlier unknowns no longer matter
+            st.template = template if template is not None and _has_unknowns(template) else None
             if w.uncertain:
                 st.problems.append(
                     f"{w.how} write in a branch, loop or with unresolved shell variables; may not match"
                 )
                 note = (note + "; " if note else "") + "may not have run as recorded"
             st.history.append(Version(st.content, w.how, op, note))
+        if pending:
+            observe()
         for src, dst, move in getattr(effects, "copies", []):
             src_key = canonical(src, windows)
             dst_c = canonical(dst, windows)
@@ -541,6 +618,8 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
                     if not st.history:
                         st.created = True
                     st.content = srcst.content
+                    st.problems = list(srcst.problems)
+                    st.template = srcst.template
                     st.history.append(Version(st.content, how, op, f"{how} from {key}"))
                 else:
                     mark_produced(target, f"{how} from {key}", op)

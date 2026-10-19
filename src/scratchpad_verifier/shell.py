@@ -60,6 +60,7 @@ class ShellWrite:
     # An in-place edit (sed -i): new content = transform(old content).
     transform: Callable[[str], str] | None = None
     backup: str | None = None  # where the edit saved the old content (sed -i.bak)
+    seg: int = 0  # which simple command of the shell command wrote it
 
 
 @dataclass
@@ -81,6 +82,8 @@ class ShellEffects:
     produced: list[tuple[str, str]] = field(default_factory=list)
     # Script files the command ran: (path, lang, cwd at the time, argv).
     executed: list[tuple] = field(default_factory=list)
+    # Simple commands (by index, like ShellWrite.seg) that print whole files (cat f).
+    observed: list[int] = field(default_factory=list)
 
 
 def _is_windows(path: str | None) -> bool:
@@ -437,7 +440,12 @@ def analyze_bash(
     after_or = False   # later in a chain that had ||
     gated = False      # later in a chain, after `cmd &&` where cmd could have failed
     last_chain = max([0] + [i + 1 for i, (_, sp) in enumerate(segs[:-1]) if sp not in ("&&", "||", "|")])
+    observed: list[int] = []
+    stamped = 0
     for n, (words, sep) in enumerate(segs):
+        for w in writes[stamped:]:
+            w.seg = n - 1
+        stamped = len(writes)
         prev_sep = segs[n - 1][1] if n else ""
         if prev_sep not in ("&&", "||", "|"):
             after_or = gated = False
@@ -493,6 +501,8 @@ def analyze_bash(
         target, append = _redirect_target(words)
         if target in NO_TARGET or (target and target.startswith("/dev/")):
             target = None
+        if prog == "cat" and heredoc is None and target is None and sep != "|" and _plain_args(args):
+            observed.append(n)
         lang = _interp_lang(prog)
         if heredoc is not None:
             body, expanded = bodies[heredoc]
@@ -585,7 +595,9 @@ def analyze_bash(
         elif prog == "touch":
             for f in _plain_args(args):
                 writes.append(ShellWrite(path(f), "", False, False, "touch", conditional, conditional=conditional))
-    return ShellEffects(writes, scripts, deletes, cur, copies, produced, executed)
+    for w in writes[stamped:]:
+        w.seg = len(segs) - 1
+    return ShellEffects(writes, scripts, deletes, cur, copies, produced, executed, observed)
 
 
 SCRIPT_OUTPUT_RES = {
@@ -802,8 +814,13 @@ def analyze_powershell(command: str, cwd: str | None, env: dict[str, str] | None
     def path(word: str) -> str:
         return resolve(expand(word), cur)
 
+    observed: list[int] = []
+    stamped = 0
     flat = PS_HERESTRING_RE.sub(stash, command)
-    for stmt in _ps_split(flat):
+    for n, stmt in enumerate(_ps_split(flat)):
+        for w in writes[stamped:]:
+            w.seg = n - 1
+        stamped = len(writes)
         m = PS_ASSIGN_RE.match(stmt)
         if m:
             value = m.group(2) if m.group(2) is not None else m.group(3)
@@ -827,6 +844,8 @@ def analyze_powershell(command: str, cwd: str | None, env: dict[str, str] | None
                 prev = re.search(r"__HERESTRING_(\d+)__", pipeline[k - 1])
                 prev_hs = int(prev.group(1)) if prev else None
 
+            if prog in ("get-content", "gc", "cat", "type") and k == len(pipeline) - 1 and _ps_positional(args):
+                observed.append(n)
             if prog in ("cd", "set-location", "sl", "push-location", "pushd") and args:
                 cur = path(_ps_positional(args)[-1] if _ps_positional(args) else args[-1])
                 continue
@@ -878,4 +897,6 @@ def analyze_powershell(command: str, cwd: str | None, env: dict[str, str] | None
                     tgt = words[i + 1]
                     if tgt.lower() not in ("$null", "nul") and not tgt.startswith("&"):
                         produced.append((path(tgt), f"output of {prog}" + (" (appended)" if w == ">>" else "")))
-    return ShellEffects(writes, scripts, deletes, cur, copies, produced, executed)
+    for w in writes[stamped:]:
+        w.seg = n
+    return ShellEffects(writes, scripts, deletes, cur, copies, produced, executed, observed)

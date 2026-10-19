@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator
 
-from .shell import InlineScript, analyze_bash, analyze_powershell, resolve, script_outputs
+from .shell import Hole, InlineScript, analyze_bash, analyze_powershell, resolve, script_outputs
 
 DEFAULT_PREFIXES = ("/tmp/",)
 DEFAULT_MARKERS = ("/scratchpad/",)
@@ -64,6 +64,23 @@ class Version:
 
 
 @dataclass
+class Branch:
+    """One possible content of a file whose history is uncertain."""
+
+    pieces: list              # literal strings and Holes (unresolved expansions)
+    choices: list[str] = field(default_factory=list)  # "ran: echo in command 3", "skipped: ..."
+    approx: bool = False      # a Hole went through sed or an Edit: content is a guess
+
+    @property
+    def content(self) -> str:
+        return "".join(self.pieces)
+
+    @property
+    def exact(self) -> bool:
+        return not self.approx and not any(isinstance(p, Hole) for p in self.pieces)
+
+
+@dataclass
 class FileState:
     """Reconstructed history of one file."""
 
@@ -75,8 +92,11 @@ class FileState:
     created: bool = False     # first known write created it (vs. editing an existing file)
     deleted: bool = False     # removed with rm / del / Remove-Item at some point
     category: str = "other"   # scratchpad, tmp, ran_from_root or other
-    # While the content is uncertain: what it can be, as pieces (see _template_regex).
-    template: list | None = None
+    # While it's uncertain which changes happened: every possible content (branch
+    # 0 assumes they all ran, like `content`), and the index in history of the
+    # first version that's only true on some branches.
+    branches: list[Branch] | None = None
+    fork: int | None = None
 
     @property
     def versions(self) -> list[str]:
@@ -299,8 +319,17 @@ def _apply_file_tool(st: FileState, op: Operation, base: str | None = None) -> N
             st.problems.append(f"{op.tool} before any Write and no original content recorded")
             return
 
+    content = _edited(st.content, op)
+    if content is None:
+        st.problems.append(f"{op.tool} old_string not found ({op.tool_use_id})")
+        return
+    st.content = content
+    st.history.append(Version(content, op.tool, op))
+
+
+def _edited(content: str, op: Operation) -> str | None:
+    """content after an Edit / MultiEdit, or None if an old_string isn't in it."""
     edits = [op.input] if op.tool == "Edit" else (op.input.get("edits") or [])
-    content = st.content
     for edit in edits:
         content = _apply_edit(
             content,
@@ -309,10 +338,8 @@ def _apply_file_tool(st: FileState, op: Operation, base: str | None = None) -> N
             bool(edit.get("replace_all")),
         )
         if content is None:
-            st.problems.append(f"{op.tool} old_string not found ({op.tool_use_id})")
-            return
-    st.content = content
-    st.history.append(Version(content, op.tool, op))
+            return None
+    return content
 
 
 def _mark_deleted(files: dict[str, FileState], target: str) -> None:
@@ -407,44 +434,83 @@ def _is_dir_target(dst: str, files: dict) -> bool:
     return any(k.startswith(prefix) for k in files)
 
 
-# Templates describe a file whose content is only partly known. A piece is a
-# literal string, None for the output of an unresolved expansion (within one
-# line), or ("alt", a, b): content a, or else content b (both piece lists),
-# for a write that may not have run.
+# Branches: when a change may not have happened (a write after `cmd &&`, after
+# ||, in an if/else or loop), the file forks into the version where it ran and
+# the one where it didn't; later changes apply to every branch. A full Read, a
+# cat whose output fits, an Edit whose old_string only one branch contains, or
+# a certain overwrite brings it back to one version.
+
+MAX_BRANCHES = 32
 
 
-def _template_of(st: FileState) -> list | None:
-    if st.template is not None:
-        return st.template
-    return [st.content] if st.content is not None else None
-
-
-def _has_unknowns(template: list) -> bool:
-    return any(not isinstance(p, str) for p in template)
-
-
-def _template_regex(template: list) -> str:
-    out = []
-    for p in template:
-        if isinstance(p, str):
-            out.append(re.escape(p))
-        elif p is None:
-            out.append(r"[^\n]*?")
+def _normalize(pieces: list) -> list:
+    """Merge adjacent literal strings and drop empty ones, so equal content compares equal."""
+    out: list = []
+    for p in pieces:
+        if not p:
+            continue
+        if out and not isinstance(p, Hole) and not isinstance(out[-1], Hole):
+            out[-1] = out[-1] + p
         else:
-            out.append(f"(?:{_template_regex(p[1])}|{_template_regex(p[2])})")
-    return "".join(out)
+            out.append(p)
+    return out
 
 
-def _observed_content(template: list, output: str) -> str | None:
-    """The file's content, if output shows it in exactly one way that fits the template."""
-    rx = re.compile(r"(?m)^" + _template_regex(template) + r"(?:(?<=\n)|(?=\n|\Z))")
-    if rx.fullmatch(""):
-        return None  # everything optional: any output "matches"
+def _branches_of(st: FileState) -> list[Branch] | None:
+    if st.branches is not None:
+        return st.branches
+    return [Branch([st.content] if st.content else [])] if st.content is not None else None
+
+
+def _set_branches(st: FileState, branches: list[Branch], problem: str = "") -> None:
+    """Store a file's possible contents; one fully known branch means it's certain again."""
+    unique: dict = {}
+    for b in branches:
+        b.pieces = _normalize(b.pieces)
+        unique.setdefault((b.approx, *((isinstance(p, Hole), p) for p in b.pieces)), b)
+    branches = list(unique.values())
+    if len(branches) > MAX_BRANCHES:
+        branches = branches[:MAX_BRANCHES]
+        problem = f"more than {MAX_BRANCHES} possible versions; only the first {MAX_BRANCHES} are kept"
+    st.content = branches[0].content
+    if len(branches) == 1 and branches[0].exact:
+        if st.branches is not None:
+            st.problems.clear()  # one possibility left: the uncertainty is settled
+        st.branches = st.fork = None
+        return
+    if st.branches is None:
+        st.fork = len(st.history)  # the version about to be added is the first branched one
+    st.branches = branches
+    if problem:
+        st.problems.append(problem)
+
+
+def _settle(st: FileState, content: str) -> None:
+    """Known content (a Read, a cat): no more branches or problems."""
+    st.content = content
+    st.branches = st.fork = None
+    st.problems.clear()
+
+
+def _branch_regex(pieces: list) -> str:
+    return "".join(r"[^\n]*?" if isinstance(p, Hole) else re.escape(p) for p in pieces)
+
+
+def _observed_content(branches: list[Branch], output: str) -> str | None:
+    """The file's content, if output prints one of its branches in exactly one way."""
     text = output.replace("\r\n", "\n")
     if not text.endswith("\n"):
         text += "\n"  # tool results drop the final newline
-    found = {m.group(0) for m in rx.finditer(text) if m.group(0)}
-    return found.pop() if len(found) == 1 else None
+    spans: set[tuple[int, int]] = set()
+    for b in branches:
+        rx = re.compile(r"(?m)^" + _branch_regex(b.pieces) + r"(?:(?<=\n)|(?=\n|\Z))")
+        if rx.fullmatch(""):
+            return None  # an empty branch "matches" any output
+        spans |= {m.span() for m in rx.finditer(text)}
+    # cat prints the whole file, so a branch matching inside another branch's
+    # match (its start, or its last lines) is just part of it.
+    outer = {text[a:b] for a, b in spans if not any(c <= a and b <= d and (c, d) != (a, b) for c, d in spans)}
+    return outer.pop() if len(outer) == 1 else None
 
 
 def analyze(transcript: Path, include_subagents: bool = True) -> Session:
@@ -475,7 +541,18 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
         pr.ops.append(op)
         if key in files:
             files[key].problems.append(f"later changed by a command ({how}); final content unknown")
-            files[key].template = None
+            files[key].branches = files[key].fork = None
+
+    def copy_into(st: FileState, src: FileState, how: str, op: Operation, note: str) -> None:
+        """st becomes a copy of src, branches included."""
+        st.operations.append(op)
+        if not st.history:
+            st.created = True
+        st.content = src.content
+        st.problems = list(src.problems)
+        st.branches = [Branch(list(b.pieces), list(b.choices), b.approx) for b in src.branches or []] or None
+        st.fork = len(st.history) if st.branches else None
+        st.history.append(Version(st.content, how, op, note))
 
     for op in calls:
         if op.tool == "Read" and op.path and not op.is_error:
@@ -490,19 +567,35 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
             if st is not None and st.history and (st.content != content or st.problems):
                 if st.content != content:
                     st.history.append(Version(content, "Read", op, "content observed by Read"))
-                st.content = content
-                st.problems.clear()
-                st.template = None
+                _settle(st, content)
             continue
 
         if op.tool in FILE_TOOLS and op.path:
             st = state(op.path)
             st.operations.append(op)
-            if not op.is_error:
-                if st.deleted and op.tool == "Write":
-                    st.created = True
-                _apply_file_tool(st, op, reads.get(st.path))
-                st.template = None
+            if op.is_error:
+                continue
+            if st.deleted and op.tool == "Write":
+                st.created = True
+            if st.branches is not None and op.tool != "Write":
+                original = (op.result or {}).get("originalFile")
+                if isinstance(original, str):
+                    _settle(st, original)  # the tool recorded what the file really was
+                else:
+                    # The edit worked, so its old_string is in the real content:
+                    # only branches that contain it are still possible.
+                    survivors = []
+                    for b in st.branches:
+                        new = _edited(b.content, op)
+                        if new is not None:
+                            survivors.append(Branch([new], b.choices, b.approx or not b.exact))
+                    if survivors:
+                        _set_branches(st, survivors)
+                        st.history.append(Version(st.content, op.tool, op))
+                        continue
+            _apply_file_tool(st, op, reads.get(st.path))
+            if op.tool == "Write":
+                st.branches = st.fork = None
             continue
 
         if op.tool not in SHELL_TOOLS:
@@ -520,84 +613,89 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
         except Exception:  # never let one odd command break the whole replay
             continue
         pending = sorted(getattr(effects, "observed", []))
+        index = len(commands) - 1
 
         def observe() -> None:
-            """A cat printed whole files: settle uncertain ones whose template fits."""
+            """A cat printed whole files: settle branched ones whose output fits one branch."""
             for st in files.values():
-                if st.template is None:
+                if st.branches is None:
                     continue
-                seen = _observed_content(st.template, op.output)
+                seen = _observed_content(st.branches, op.output)
                 if seen is None:
                     continue
-                if seen != st.content:
+                if seen != st.content or st.fork is not None:
                     st.history.append(Version(seen, "observed", op, "content printed by a later command"))
-                st.content = seen
-                st.problems.clear()
-                st.template = None
+                _settle(st, seen)
 
         for w in effects.writes:
             if pending and pending[0] < w.seg:
                 observe()
                 pending = [s for s in pending if s >= w.seg]
+            label = f"{w.how} in command {index}"
             if w.transform is not None:
                 st = files.get(canonical(w.path, windows))
-                new = None
-                if st is not None and st.content is not None:
+                base = _branches_of(st) if st is not None else None
+                edited = []
+                for b in base or []:
                     try:
-                        new = w.transform(st.content)
+                        new = w.transform(b.content)
                     except Exception:
                         new = None
-                if new is None:
+                    if new is None:
+                        edited = None
+                        break
+                    edited.append(Branch([new], b.choices, b.approx or not b.exact))
+                if not edited:
                     mark_produced(w.path, "edited in place by sed -i", op)
                     continue
                 if w.backup:
-                    bst = state(w.backup)
-                    bst.operations.append(op)
-                    bst.created = bst.created or not bst.history
-                    bst.content = st.content
-                    bst.problems = list(st.problems)
-                    bst.history.append(Version(st.content, "sed -i backup", op, f"backup of {st.path}"))
+                    copy_into(state(w.backup), st, "sed -i backup", op, f"backup of {st.path}")
                 st.operations.append(op)
-                st.content = new
-                st.template = None  # can't edit a template; problems stay
                 note = ""
                 if w.conditional:
-                    st.problems.append("sed -i in a branch, loop or after ||; may not have run")
+                    for b, e in zip(base, edited):
+                        e.choices = e.choices + [f"ran: {label}"]
+                    edited += [Branch(list(b.pieces), b.choices + [f"skipped: {label}"], b.approx) for b in base]
                     note = "may not have run as recorded"
-                st.history.append(Version(new, w.how, op, note))
+                _set_branches(st, edited, "sed -i in a branch, loop or after ||; may not have run"
+                              if w.conditional else "")
+                st.history.append(Version(st.content, w.how, op, note))
                 continue
             st = state(w.path)
             st.operations.append(op)
             note = "shell expansion not applied" if w.expanded else ""
             new = w.parts if w.parts is not None else [w.content]
+            ran = [f"ran: {label}"] if w.conditional else []
             if w.append:
                 if st.content is None and len(st.operations) == 1 and own_scratchpad in st.path:
                     # The session's own scratchpad starts empty, so a first append creates the file.
                     st.created = True
                     st.content = ""
-                base = _template_of(st)
-                if st.content is None:
+                base = _branches_of(st)
+                if base is None:
                     st.problems.append("appended to a file whose earlier content is unknown")
-                    st.content = ""
                     note = (note + "; " if note else "") + "earlier content unknown"
-                st.content = st.content + w.content
-                template = None if base is None else base + ([("alt", new, [])] if w.conditional else new)
+                    base = [Branch([])]
+                branches = [Branch(b.pieces + new, b.choices + ran, b.approx) for b in base]
             else:
                 if not st.history:
                     st.created = True
-                old = _template_of(st)
-                if w.conditional:
-                    template = None if old is None else [("alt", new, old)]
-                else:
-                    template = new
+                base = _branches_of(st)
+                branches = [Branch(list(new), ran)]
+                if not w.conditional:
                     st.problems.clear()  # overwritten: earlier unknowns no longer matter
-                st.content = w.content
-            st.template = template if template is not None and _has_unknowns(template) else None
+                    st.branches = st.fork = None
+                elif base is None:
+                    st.problems.append(f"{w.how} write may not have run, and the earlier content is unknown")
+                    base = []
+            if w.conditional:
+                branches += [Branch(list(b.pieces), b.choices + [f"skipped: {label}"], b.approx) for b in base]
+                note = (note + "; " if note else "") + "may not have run as recorded"
+            _set_branches(st, branches)
             if w.uncertain:
                 st.problems.append(
                     f"{w.how} write in a branch, loop or with unresolved shell variables; may not match"
                 )
-                note = (note + "; " if note else "") + "may not have run as recorded"
             st.history.append(Version(st.content, w.how, op, note))
         if pending:
             observe()
@@ -613,14 +711,7 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
                 if move and srcst is not None:
                     srcst.deleted = True
                 if srcst is not None and srcst.content is not None:
-                    st = state(target)
-                    st.operations.append(op)
-                    if not st.history:
-                        st.created = True
-                    st.content = srcst.content
-                    st.problems = list(srcst.problems)
-                    st.template = srcst.template
-                    st.history.append(Version(st.content, how, op, f"{how} from {key}"))
+                    copy_into(state(target), srcst, how, op, f"{how} from {key}")
                 else:
                     mark_produced(target, f"{how} from {key}", op)
         for s_ in effects.scripts:
@@ -775,3 +866,10 @@ def versioned_names(path: str, count: int) -> list[str]:
         stem, dot, ext = name, "", ""
     width = max(2, len(str(count - 1)))
     return [f"{stem}_{i:0{width}d}{dot}{ext}" for i in range(count)]
+
+
+def branch_names(path: str, fork: int, versions: int, count: int) -> list[str]:
+    """mutate.py forked at version 2 of 3, two branches -> ['mutate_02_branch_0.py', 'mutate_02_branch_1.py']."""
+    name = versioned_names(path, max(versions, fork + 1))[fork]
+    stem, dot, ext = name.rpartition(".") if "." in PurePosixPath(_norm(path)).name.lstrip(".") else (name, "", "")
+    return [f"{stem}_branch_{k}{dot}{ext}" for k in range(count)]

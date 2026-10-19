@@ -53,8 +53,8 @@ class ShellWrite:
     # The write may not have happened as recorded: it sits in an if/else branch,
     # a loop or after ||, or its content has shell expansions we can't resolve.
     uncertain: bool = False
-    # Content with unresolved expansions: literal strings, and None where an
-    # expansion goes. None when the content is fully known.
+    # Content with unresolved expansions: literal strings and Holes. None when
+    # the content is fully known.
     parts: list | None = None
     conditional: bool = False  # it may not have run at all
     # An in-place edit (sed -i): new content = transform(old content).
@@ -189,14 +189,18 @@ def _lit(text: str) -> str:
 HOLE_RE = re.compile(r"\x02|\$\{[^}\n]*\}|\$\([^)\n]*\)|\$(?:[A-Za-z_]\w*|[0-9?#$!@*-])|`[^`\n]*`")
 
 
+class Hole(str):
+    """An unresolved expansion ($r, $(...)) as written; the text it stands for is unknown."""
+
+
 def _parts(text: str) -> list:
-    """Split text at unresolved expansions: literal strings, and None for each expansion."""
+    """Split text at unresolved expansions: literal strings, and a Hole for each expansion."""
     parts: list = []
     pos = 0
     for m in HOLE_RE.finditer(text):
         if m.start() > pos:
             parts.append(_lit(text[pos : m.start()]))
-        parts.append(None)
+        parts.append(Hole(_lit(m.group(0))))
         pos = m.end()
     if pos < len(text):
         parts.append(_lit(text[pos:]))

@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import tempfile
@@ -7,7 +8,7 @@ from pathlib import Path
 
 from scratchpad_verifier.cli import main
 from scratchpad_verifier.sed import parse_in_place
-from scratchpad_verifier.shell import analyze_bash, analyze_powershell, script_outputs
+from scratchpad_verifier.shell import Hole, analyze_bash, analyze_powershell, script_outputs
 from scratchpad_verifier.transcript import analyze, output_dir_for, reconstruct, versioned_names
 
 
@@ -492,7 +493,8 @@ class ShellAnalysisTests(unittest.TestCase):
         self.assertFalse(writes["/tmp/s/a"].uncertain or writes["/tmp/s/b"].uncertain)
         log = writes["/tmp/s/log"]
         self.assertTrue(log.append and log.uncertain and not log.conditional)
-        self.assertEqual(log.parts, ["- step ", None, " done\n"])
+        self.assertEqual(log.parts, ["- step ", "$(...)", " done\n"])
+        self.assertIsInstance(log.parts[1], Hole)
 
     def test_printf_and_echo_escapes(self):
         fx = analyze_bash(
@@ -509,7 +511,7 @@ class ShellAnalysisTests(unittest.TestCase):
         self.assertIn(("/tmp/wide", "output of printf"), fx.produced)
 
 
-class ObservedContentTests(unittest.TestCase):
+class ShellSession:
     LOG = "/tmp/sp/scratchpad/log.md"
 
     def setUp(self):
@@ -527,6 +529,8 @@ class ObservedContentTests(unittest.TestCase):
         write_jsonl(self.transcript, records)
         return reconstruct(self.transcript)[self.LOG]
 
+
+class ObservedContentTests(ShellSession, unittest.TestCase):
     def test_later_cat_settles_gated_appends_and_variables(self):
         st = self.run_commands(
             (f"echo start > {self.LOG}\nmake && echo built >> {self.LOG}\n"
@@ -559,6 +563,67 @@ class ObservedContentTests(unittest.TestCase):
         )
         self.assertFalse(reconstruct(self.transcript)["/tmp/sp/scratchpad/copy.md"].complete)
         self.assertFalse(st.complete)
+
+
+class BranchTests(ShellSession, unittest.TestCase):
+    def test_uncertain_append_forks_and_extracts_branches(self):
+        st = self.run_commands(
+            (f"echo start > {self.LOG}\necho two >> {self.LOG}\nmake && echo built >> {self.LOG}\n"
+             f"echo end >> {self.LOG}\ntrue", ""),
+        )
+        self.assertEqual([b.content for b in st.branches], ["start\ntwo\nbuilt\nend\n", "start\ntwo\nend\n"])
+        self.assertEqual([b.choices for b in st.branches], [["ran: echo in command 0"], ["skipped: echo in command 0"]])
+        self.assertEqual(st.fork, 2)
+        out = Path(self.tmp.name) / "out"
+        with redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            main(["extract", str(self.transcript), "-o", str(out)])
+        sp = out / "s" / "scratchpad"
+        self.assertEqual(sorted(p.name for p in sp.iterdir()),
+                         ["log_00.md", "log_01.md", "log_02_branch_0.md", "log_02_branch_1.md"])
+        self.assertEqual((sp / "log_02_branch_1.md").read_text(), "start\ntwo\nend\n")
+        manifest = json.loads((out / "s" / "manifest.json").read_text())
+        self.assertEqual(manifest["files"][0]["status"], "branched")
+        self.assertEqual(manifest["files"][0]["branches"][1]["file"], "scratchpad/log_02_branch_1.md")
+
+    def test_two_uncertain_writes_make_every_combination(self):
+        st = self.run_commands(
+            (f"echo a > {self.LOG}\nx && echo b >> {self.LOG}\ny || echo c >> {self.LOG}\ntrue", ""),
+        )
+        self.assertEqual(sorted(b.content for b in st.branches), ["a\n", "a\nb\n", "a\nb\nc\n", "a\nc\n"])
+
+    def test_verify_accepts_a_matching_branch(self):
+        self.run_commands((f"echo start > {self.LOG}\nmake && echo built >> {self.LOG}\ntrue", ""))
+        root = Path(self.tmp.name) / "root"
+        disk = root / self.LOG.lstrip("/")
+        disk.parent.mkdir(parents=True)
+        disk.write_text("start\n")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = main(["verify", str(self.transcript), "--root", str(root)])
+        self.assertEqual(rc, 0)
+        self.assertIn("(branch 1 of 2)", buf.getvalue())
+        disk.write_text("other\n")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["verify", str(self.transcript), "--root", str(root)]), 1)
+
+    def test_edit_keeps_only_branches_that_contain_its_old_string(self):
+        records = []
+        for i, command in enumerate([f"echo start > {self.LOG}\nmake && echo built >> {self.LOG}\ntrue"]):
+            records += [tool_use(f"b{i}", "Bash", {"command": command}, f"{i}", cwd="/w"),
+                        tool_result(f"b{i}", f"{i}b")]
+        records += [tool_use("e1", "Edit", {"file_path": self.LOG, "old_string": "built", "new_string": "done"}, "5"),
+                    tool_result("e1", "5b")]
+        write_jsonl(self.transcript, records)
+        st = reconstruct(self.transcript)[self.LOG]
+        self.assertIsNone(st.branches)
+        self.assertEqual(st.content, "start\ndone\n")
+        self.assertTrue(st.complete)
+
+    def test_conditional_sed_branches(self):
+        st = self.run_commands(
+            (f"echo 'x = 1' > {self.LOG}\ncheck && sed -i 's/1/2/' {self.LOG}\ntrue", ""),
+        )
+        self.assertEqual([b.content for b in st.branches], ["x = 2\n", "x = 1\n"])
 
 
 class SedTests(unittest.TestCase):

@@ -18,6 +18,7 @@ from .transcript import (
     Operation,
     Session,
     analyze,
+    branch_names,
     output_dir_for,
     path_matches,
     select,
@@ -46,10 +47,23 @@ def _load(args: argparse.Namespace) -> tuple[Session, dict[str, FileState]]:
     return session, select(session, prefixes, markers, match_all=args.all)
 
 
+def _branched(st: FileState) -> bool:
+    return bool(st.branches) and len(st.branches) > 1
+
+
 def _status(st: FileState) -> str:
     if st.content is None:
         return "unknown"
+    if _branched(st):
+        return "branched"
     return "partial" if st.problems else "ok"
+
+
+def _candidates(st: FileState) -> list[str]:
+    """Contents the file can have: every exact branch, or the reconstructed content."""
+    if _branched(st):
+        return [b.content for b in st.branches if b.exact]
+    return [st.content] if st.content is not None else []
 
 
 def _error_record(op: Operation) -> dict:
@@ -94,6 +108,10 @@ def _file_summary(st: FileState) -> dict:
         "bytes": len(st.content.encode()) if st.content is not None else None,
         "errored": [{"tool": o.tool, "timestamp": o.timestamp, "error": o.error} for o in st.errored],
         "problems": st.problems,
+        "branches": [
+            {"choices": b.choices, "exact": b.exact, "bytes": len(b.content.encode())}
+            for b in st.branches
+        ] if _branched(st) else [],
     }
 
 
@@ -120,6 +138,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         hist = ",".join(v.how for v in st.history) or "-"
         if st.errored:
             hist += "," + ",".join(o.tool + "!" for o in st.errored)
+        if _branched(st):
+            hist += f"; {len(st.branches)} branches from v{st.fork}"
         flag = " (deleted)" if st.deleted else ""
         print(f"{_status(st):<8} {st.category:<13} {size}  v{len(st.history):<3} {st.path}{flag}  [{hist}]")
     if not files:
@@ -241,11 +261,17 @@ def extract(session: Session, files: dict[str, FileState], args: argparse.Namesp
         entry = _file_summary(st)
         entry["versions"] = []
         names = versioned_names(st.path, len(st.history))
-        for name, v in zip(names, st.history):
+        # A branched file: the versions before the fork, then each possible content.
+        linear = st.history[: st.fork] if _branched(st) else st.history
+        for name, v in zip(names, linear):
             rel = out.write(rel_dir / name, v.content)
             entry["versions"].append(
                 {"file": rel, "how": v.how, "timestamp": v.op.timestamp, "note": v.note or None}
             )
+        if _branched(st):
+            names = branch_names(st.path, st.fork, len(st.history), len(st.branches))
+            for name, b, info in zip(names, st.branches, entry["branches"]):
+                info["file"] = out.write(rel_dir / name, b.content)
         # Edits on a file whose content we never saw: keep them as patches.
         if not st.history:
             edits = [o for o in st.operations if o.tool in ("Edit", "MultiEdit") and not o.is_error]
@@ -349,19 +375,23 @@ def cmd_verify(args: argparse.Namespace) -> int:
         if st.deleted:
             continue  # cleaned up on purpose; nothing to compare
         disk = Path(st.path) if root is None else root / st.path.lstrip("/\\")
+        label = ""
         if st.content is None:
             result = "UNKNOWN"
         elif not disk.is_file():
             result = "MISSING"
         else:
             try:
-                same = disk.read_text(encoding="utf-8") == st.content
+                text = disk.read_text(encoding="utf-8")
             except UnicodeDecodeError:
-                same = False
-            result = "MATCH" if same else "DIFFERS"
+                text = None
+            result = "MATCH" if text in _candidates(st) else "DIFFERS"
+            if result == "MATCH" and _branched(st):
+                k = next(i for i, b in enumerate(st.branches) if b.exact and b.content == text)
+                label = f"  (branch {k} of {len(st.branches)})"
         if result != "MATCH":
             mismatches += 1
-        print(f"{result:<8} {st.path}")
+        print(f"{result:<8} {st.path}{label}")
     return 1 if mismatches else 0
 
 

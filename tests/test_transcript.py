@@ -477,6 +477,36 @@ class ShellAnalysisTests(unittest.TestCase):
                                   "/tmp/gated": True, "/tmp/d/safe": False, "/tmp/last": False})
         self.assertEqual(fx.produced, [])
 
+    def test_single_quotes_and_command_substitution(self):
+        fx = analyze_bash(
+            "SP=/tmp/s\n"
+            "echo 'cost $SP' > $SP/a\n"
+            "echo \"at \\$SP and $SP\" > $SP/b\n"
+            "echo \"- step $( [ -d \"$SP/x\" ] && echo worked || echo failed) done\" >> \"$SP/log\"\n",
+            "/w",
+        )
+        writes = {w.path: w for w in fx.writes}
+        self.assertEqual(writes["/tmp/s/a"].content, "cost $SP\n")
+        self.assertEqual(writes["/tmp/s/b"].content, "at $SP and /tmp/s\n")
+        self.assertFalse(writes["/tmp/s/a"].uncertain or writes["/tmp/s/b"].uncertain)
+        log = writes["/tmp/s/log"]
+        self.assertTrue(log.append and log.uncertain and not log.conditional)
+        self.assertEqual(log.parts, ["- step ", None, " done\n"])
+
+    def test_printf_and_echo_escapes(self):
+        fx = analyze_bash(
+            "printf '%s\\n' \"one\" 'two' > /tmp/p\n"
+            "printf 'n=%d%%\\n' 5 2>/dev/null >> /tmp/p\n"
+            "printf '%5s' x > /tmp/wide\n"
+            "echo -e 'a\\tb' > /tmp/e\n"
+            "echo -n 'a\\tb' > /tmp/n\n",
+            "/w",
+        )
+        self.assertEqual([(w.path, w.content) for w in fx.writes], [
+            ("/tmp/p", "one\ntwo\n"), ("/tmp/p", "n=5%\n"), ("/tmp/e", "a\tb\n"), ("/tmp/n", "a\\tb"),
+        ])
+        self.assertIn(("/tmp/wide", "output of printf"), fx.produced)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,6 +49,10 @@ class ShellWrite:
     # The write may not have happened as recorded: it sits in an if/else branch,
     # a loop or after ||, or its content has shell expansions we can't resolve.
     uncertain: bool = False
+    # Content with unresolved expansions: literal strings, and None where an
+    # expansion goes. None when the content is fully known.
+    parts: list | None = None
+    conditional: bool = False  # it may not have run at all
 
 
 @dataclass
@@ -99,6 +103,94 @@ def _split_words(text: str) -> list[str]:
         return list(lex)
     except ValueError:
         return text.split()
+
+
+# Stand-ins the analysis passes around in place of the real characters:
+# a $ or ` the shell won't expand (single quotes, \$), and a whole $(...) or
+# `...` command substitution, whose output we can't know.
+QUOTED_DOLLAR, QUOTED_TICK, SUBST = "\x00", "\x01", "\x02"
+UNEXPANDED = {"$": QUOTED_DOLLAR, "`": QUOTED_TICK}
+
+
+def _subst_end(text: str, i: int) -> int | None:
+    """Index just past the ) that closes a $( opened before text[i]."""
+    depth, quote = 1, None
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"':
+                i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "\\":
+            i += 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _protect(text: str) -> str:
+    """Mark the $ and ` the shell leaves alone, and replace command substitutions with SUBST."""
+    out = []
+    quote = None
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            out.append(UNEXPANDED.get(c, c))
+            i += 1
+            continue
+        if c == "\\" and i + 1 < len(text):
+            out.append(UNEXPANDED.get(text[i + 1], text[i : i + 2]))
+            i += 2
+            continue
+        end = None
+        if c == "$" and text[i + 1 : i + 2] == "(":
+            end = _subst_end(text, i + 2)
+        elif c == "`":
+            end = text.find("`", i + 1) + 1 or None
+        if end:
+            out.append(SUBST)
+            i = end
+            continue
+        if c == '"':
+            quote = None if quote else '"'
+        elif c == "'" and not quote:
+            quote = "'"
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _lit(text: str) -> str:
+    """The text with the stand-ins turned back into what was written."""
+    return text.replace(QUOTED_DOLLAR, "$").replace(QUOTED_TICK, "`").replace(SUBST, "$(...)")
+
+
+HOLE_RE = re.compile(r"\x02|\$\{[^}\n]*\}|\$\([^)\n]*\)|\$(?:[A-Za-z_]\w*|[0-9?#$!@*-])|`[^`\n]*`")
+
+
+def _parts(text: str) -> list:
+    """Split text at unresolved expansions: literal strings, and None for each expansion."""
+    parts: list = []
+    pos = 0
+    for m in HOLE_RE.finditer(text):
+        if m.start() > pos:
+            parts.append(_lit(text[pos : m.start()]))
+        parts.append(None)
+        pos = m.end()
+    if pos < len(text):
+        parts.append(_lit(text[pos:]))
+    return parts
 
 
 def _newlines_to_semicolons(text: str) -> str:
@@ -244,19 +336,47 @@ def _cd_target(segment: str) -> str | None:
     return None
 
 
-def _echo_content(args: list[str]) -> str | None:
-    newline = True
+REDIRECT_OP_RE = re.compile(r"[<>&|]*[<>][<>&|]*")
+
+
+def _strip_redirects(args: list[str]) -> list[str]:
+    """Arguments without redirections (> f, 2>&1, &> f, < f)."""
     out = []
-    for a in args:
-        if a in (">", ">>", ">|"):
-            break
-        if not out and a == "-n":
-            newline = False
-        elif not out and a in ("-e", "-E"):
-            continue
+    skip = False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+        elif REDIRECT_OP_RE.fullmatch(a):
+            skip = True
+        elif a.isdigit() and i + 1 < len(args) and REDIRECT_OP_RE.fullmatch(args[i + 1]):
+            continue  # the fd in 2>&1
         else:
             out.append(a)
-    return " ".join(out) + ("\n" if newline else "")
+    return out
+
+
+ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "a": "\a", "b": "\b",
+           "f": "\f", "v": "\v", "e": "\x1b", '"': '"'}
+
+
+def _backslash_escapes(text: str) -> str:
+    """echo -e / printf escapes; unknown ones stay as written, like bash."""
+    return re.sub(r"\\(.)", lambda m: ESCAPES.get(m.group(1), m.group(0)), text)
+
+
+def _echo_content(args: list[str]) -> str | None:
+    words = _strip_redirects(args)
+    newline, escapes = True, False
+    while words and re.fullmatch(r"-[neE]+", words[0]):
+        for flag in words.pop(0)[1:]:
+            if flag == "n":
+                newline = False
+            else:
+                escapes = flag == "e"
+    text = " ".join(words)
+    if escapes:
+        text = _backslash_escapes(text)
+    return text + ("\n" if newline else "")
 
 
 VAR_RE = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
@@ -267,7 +387,7 @@ CLOSERS = {"fi", "done", "esac"}
 BRANCHES = {"then", "else", "elif", "do", "!"}
 # Commands that practically never fail, so `cmd && write` after them still writes.
 SAFE_GATES = {"", "cd", "pushd", "mkdir", "echo", "printf", "cat", "touch", "export", "true", ":"}
-UNRESOLVED_RE = re.compile(r"\$[A-Za-z_{(]|`")
+UNRESOLVED_RE = re.compile(r"\$[A-Za-z_{(0-9?#$!@*-]|`|\x02")
 
 
 def _expand(text: str, env: dict[str, str]) -> str:
@@ -301,10 +421,10 @@ def analyze_bash(
         word = _expand(word, env)
         if word.startswith("~/") and env.get("HOME"):
             word = env["HOME"].rstrip("/") + word[1:]
-        return resolve(word, cur)
+        return resolve(_lit(word), cur)
 
     flat, bodies = _extract_heredocs(command)
-    segs = _segments(_split_words(_newlines_to_semicolons(flat)))
+    segs = _segments(_split_words(_newlines_to_semicolons(_protect(flat))))
     skip_seg = -1
     depth = 0          # inside if / loop / case bodies
     after_or = False   # later in a chain that had ||
@@ -375,12 +495,13 @@ def analyze_bash(
                 target, append = _tee_target(segs[n + 1][0])
                 skip_seg = n + 1
             if prog in ("cat", "tee", "") and target and target not in NO_TARGET:
-                unsure = conditional or (expanded and bool(UNRESOLVED_RE.search(body)))
-                writes.append(ShellWrite(path(target), body, append, expanded, "heredoc", unsure))
+                parts = _parts(body) if expanded and UNRESOLVED_RE.search(body) else None
+                writes.append(ShellWrite(path(target), body, append, expanded, "heredoc",
+                                         conditional or parts is not None, parts, conditional))
                 continue
             if lang:
                 scripts.append(InlineScript(lang, body, prog, "heredoc"))
-                argv = ["-"] + [_expand(a, env) for a in _plain_args(args) if a != "-" and not MARKER_RE.match(a)]
+                argv = ["-"] + [_lit(_expand(a, env)) for a in _plain_args(args) if a != "-" and not MARKER_RE.match(a)]
                 produced.extend(
                     (path(p), f"written by {prog} script") for p in script_outputs(body, lang, argv)
                 )
@@ -400,9 +521,9 @@ def analyze_bash(
         if lang and INLINE_FLAGS.get(lang) in args:
             k = args.index(INLINE_FLAGS[lang])
             if k + 1 < len(args):
-                code = args[k + 1].rstrip("\n") + "\n"
+                code = _lit(args[k + 1]).rstrip("\n") + "\n"
                 scripts.append(InlineScript(lang, code, prog, "inline"))
-                argv = ["-c"] + [_expand(a, env) for a in _plain_args(args[k + 2 :])]
+                argv = ["-c"] + [_lit(_expand(a, env)) for a in _plain_args(args[k + 2 :])]
                 produced.extend((path(p), f"written by {prog} -c") for p in script_outputs(code, lang, argv))
         if closes_group and target:
             produced.append((path(target), "output of a command group"))
@@ -412,8 +533,9 @@ def analyze_bash(
             if content is not None:
                 expanded = any("$" in a for a in args)
                 content = _expand(content, env)
-                unsure = conditional or bool(UNRESOLVED_RE.search(content))
-                writes.append(ShellWrite(path(target), content, append, expanded, prog, unsure))
+                parts = _parts(content) if UNRESOLVED_RE.search(content) else None
+                writes.append(ShellWrite(path(target), _lit(content), append, expanded, prog,
+                                         conditional or parts is not None, parts, conditional))
                 continue
         if target:
             produced.append((path(target), f"output of {prog or 'command'}" + (" (appended)" if append else "")))
@@ -447,7 +569,7 @@ def analyze_bash(
                 produced.append((path(f), "edited in place by sed -i"))
         elif prog == "touch":
             for f in _plain_args(args):
-                writes.append(ShellWrite(path(f), "", False, False, "touch", conditional))
+                writes.append(ShellWrite(path(f), "", False, False, "touch", conditional, conditional=conditional))
     return ShellEffects(writes, scripts, deletes, cur, copies, produced, executed)
 
 
@@ -551,13 +673,31 @@ def _plain_args(args: list[str]) -> list[str]:
 
 
 def _printf_content(args: list[str]) -> str | None:
-    words = [a for a in args if a not in (">", ">>")]
-    if not words:
-        return None
-    fmt = words[0]
-    if "%" in fmt.replace("%%", ""):
-        return None  # needs formatting we don't emulate
-    return fmt.replace("%%", "%").replace("\\n", "\n").replace("\\t", "\t")
+    """printf with %s, %b, %d, %i and %%; the format repeats while arguments remain."""
+    words = _strip_redirects(args)
+    if words[:1] == ["--"]:
+        words = words[1:]
+    if not words or words[0].startswith("-"):
+        return None  # printf -v VAR writes no output
+    fmt, rest = words[0], words[1:]
+    pieces = re.split(r"(%[%sbdi])", fmt)
+    if any("%" in p for p in pieces[::2]):
+        return None  # widths, precision or other conversions we don't emulate
+    takes_args = any(p != "%%" for p in pieces[1::2])
+    out = []
+    while True:
+        for i, p in enumerate(pieces):
+            if i % 2 == 0:
+                out.append(_backslash_escapes(p))
+            elif p == "%%":
+                out.append("%")
+            else:
+                arg = rest.pop(0) if rest else ("0" if p in ("%d", "%i") else "")
+                if p in ("%d", "%i") and not re.fullmatch(r"[+-]?\d+", arg):
+                    return None
+                out.append(_backslash_escapes(arg) if p == "%b" else arg)
+        if not rest or not takes_args:
+            return "".join(out)
 
 
 PS_HERESTRING_RE = re.compile(r"@(['\"])\r?\n(.*?)\r?\n\1@", re.S)

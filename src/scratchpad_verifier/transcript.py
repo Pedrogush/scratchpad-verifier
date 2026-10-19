@@ -491,6 +491,7 @@ def analyze(transcript: Path, include_subagents: bool = True) -> Session:
                 if not st.history:
                     st.created = True
                 st.content = w.content
+                st.problems.clear()  # overwritten: earlier unknowns no longer matter
             if w.uncertain:
                 st.problems.append(
                     f"{w.how} write in a branch, loop or with unresolved shell variables; may not match"
